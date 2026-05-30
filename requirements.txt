@@ -4,3 +4,4 @@ sentence-transformers>=3.0.0
 faiss-cpu>=1.8.0
 rich>=13.7.0
 openai>=1.40.0
+flask>=3.0.0

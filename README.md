@@ -57,9 +57,26 @@ python main.py ask --index-dir artifacts/index --query "What should we prioritiz
 
 If no key is present, it automatically falls back to an extractive grounded response.
 
+## Tiny local web UI
+
+Build the index first, then run:
+
+```bash
+python web_app.py
+```
+
+Open:
+
+```text
+http://127.0.0.1:7860
+```
+
+This gives a lightweight demo surface for live query + evidence trace walkthroughs.
+
 ## Repository layout
 
 - `main.py`: end-to-end pipeline (ingest, embed, index, retrieve, answer)
+- `web_app.py`: tiny local browser UI for query + citation trace
 - `example_corpus/`: sample documents for demo
 - `artifacts/`: generated index output
 

@@ -299,6 +299,91 @@ def build_llm_answer(query: str, selected_rows: list[dict[str, Any]], model: str
     return answer
 
 
+def query_index(
+    *,
+    index_dir: Path,
+    query: str,
+    top_k: int = 6,
+    mmr_lambda: float = 0.7,
+    llm_mode: str = "auto",
+    model: str = "gpt-4.1-mini",
+) -> dict[str, Any]:
+    payload = load_index(index_dir.resolve())
+    chunks: list[Chunk] = payload["chunks"]
+    embeddings: np.ndarray = payload["embeddings"]
+    dense_index = payload["dense"]
+    vectorizer: TfidfVectorizer = payload["vectorizer"]
+    lexical_matrix = payload["lexical_matrix"]
+    labels: np.ndarray = payload["cluster_labels"]
+    keywords: dict[int, list[str]] = payload["cluster_keywords"]
+    model_name: str = payload["meta"]["embedding_model"]
+
+    embedder = EmbeddingEngine(model_name=model_name)
+    query_vec = embedder.encode([query])[0]
+
+    dense_k = min(max(top_k * 4, top_k), len(chunks))
+    scores, idxs = dense_index.search(query_vec.reshape(1, -1), dense_k)
+    dense_scores = scores[0]
+    dense_indices = idxs[0]
+
+    query_lex = vectorizer.transform([query])
+    lex_scores_all = (lexical_matrix @ query_lex.T).toarray().ravel()
+
+    dense_norm = normalize_scores(dense_scores)
+    lex_subset = np.asarray([lex_scores_all[i] for i in dense_indices], dtype=np.float32)
+    lex_norm = normalize_scores(lex_subset)
+
+    hybrid = 0.7 * dense_norm + 0.3 * lex_norm
+    ordering = np.argsort(hybrid)[::-1]
+    candidates = [int(dense_indices[i]) for i in ordering]
+
+    selected = mmr_select(
+        candidates,
+        query_vec=query_vec,
+        doc_embeddings=embeddings,
+        top_k=top_k,
+        lambda_mult=mmr_lambda,
+    )
+
+    selected_rows: list[dict[str, Any]] = []
+    for rank, idx in enumerate(selected, start=1):
+        label = int(labels[idx])
+        theme = ", ".join(keywords.get(label, ["mixed"]))
+        selected_rows.append(
+            {
+                "rank": rank,
+                "chunk": chunks[idx],
+                "citation": f"C{rank}",
+                "constellation": f"K{label} ({theme})",
+                "dense": float(np.dot(query_vec, embeddings[idx])),
+                "lex": float(lex_scores_all[idx]),
+            }
+        )
+
+    use_llm = llm_mode in {"on", "auto"}
+    if use_llm:
+        try:
+            answer = build_llm_answer(query, selected_rows, model=model)
+            answer_mode = "llm"
+        except Exception as exc:
+            if llm_mode == "on":
+                raise
+            console.print(f"[yellow]LLM fallback:[/yellow] {exc}")
+            answer = build_extractive_answer(query, selected_rows)
+            answer_mode = "extractive-fallback"
+    else:
+        answer = build_extractive_answer(query, selected_rows)
+        answer_mode = "extractive"
+
+    return {
+        "query": query,
+        "answer": answer,
+        "answer_mode": answer_mode,
+        "evidence": selected_rows,
+        "meta": payload["meta"],
+    }
+
+
 def command_index(args: argparse.Namespace) -> None:
     corpus_dir = Path(args.corpus).resolve()
     index_dir = Path(args.index_dir).resolve()
@@ -386,74 +471,24 @@ def command_map(args: argparse.Namespace) -> None:
 
 
 def command_ask(args: argparse.Namespace) -> None:
-    payload = load_index(Path(args.index_dir).resolve())
-    chunks: list[Chunk] = payload["chunks"]
-    embeddings: np.ndarray = payload["embeddings"]
-    dense_index = payload["dense"]
-    vectorizer: TfidfVectorizer = payload["vectorizer"]
-    lexical_matrix = payload["lexical_matrix"]
-    labels: np.ndarray = payload["cluster_labels"]
-    keywords: dict[int, list[str]] = payload["cluster_keywords"]
-    model_name: str = payload["meta"]["embedding_model"]
-
-    embedder = EmbeddingEngine(model_name=model_name)
-    query_vec = embedder.encode([args.query])[0]
-
-    dense_k = min(max(args.top_k * 4, args.top_k), len(chunks))
-    scores, idxs = dense_index.search(query_vec.reshape(1, -1), dense_k)
-    dense_scores = scores[0]
-    dense_indices = idxs[0]
-
-    query_lex = vectorizer.transform([args.query])
-    lex_scores_all = (lexical_matrix @ query_lex.T).toarray().ravel()
-
-    dense_norm = normalize_scores(dense_scores)
-    lex_subset = np.asarray([lex_scores_all[i] for i in dense_indices], dtype=np.float32)
-    lex_norm = normalize_scores(lex_subset)
-
-    hybrid = 0.7 * dense_norm + 0.3 * lex_norm
-    ordering = np.argsort(hybrid)[::-1]
-    candidates = [int(dense_indices[i]) for i in ordering]
-
-    selected = mmr_select(candidates, query_vec=query_vec, doc_embeddings=embeddings, top_k=args.top_k, lambda_mult=args.mmr_lambda)
-
-    selected_rows: list[dict[str, Any]] = []
-    for rank, idx in enumerate(selected, start=1):
-        label = int(labels[idx])
-        theme = ", ".join(keywords.get(label, ["mixed"]))
-        selected_rows.append(
-            {
-                "rank": rank,
-                "chunk": chunks[idx],
-                "citation": f"C{rank}",
-                "constellation": f"K{label} ({theme})",
-                "dense": float(np.dot(query_vec, embeddings[idx])),
-                "lex": float(lex_scores_all[idx]),
-            }
-        )
-
-    answer: str
-    use_llm = args.llm in {"on", "auto"}
-    if use_llm:
-        try:
-            answer = build_llm_answer(args.query, selected_rows, model=args.model)
-        except Exception as exc:
-            if args.llm == "on":
-                raise
-            console.print(f"[yellow]LLM fallback:[/yellow] {exc}")
-            answer = build_extractive_answer(args.query, selected_rows)
-    else:
-        answer = build_extractive_answer(args.query, selected_rows)
+    result = query_index(
+        index_dir=Path(args.index_dir),
+        query=args.query,
+        top_k=args.top_k,
+        mmr_lambda=args.mmr_lambda,
+        llm_mode=args.llm,
+        model=args.model,
+    )
 
     console.print("\n[bold]Answer[/bold]")
-    console.print(answer)
+    console.print(result["answer"])
 
     trace = Table(title="Evidence Trace")
     trace.add_column("Citation")
     trace.add_column("Source")
     trace.add_column("Constellation")
     trace.add_column("Snippet")
-    for row in selected_rows:
+    for row in result["evidence"]:
         snippet = row["chunk"].text[:160] + ("..." if len(row["chunk"].text) > 160 else "")
         trace.add_row(row["citation"], row["chunk"].source, row["constellation"], snippet)
     console.print(trace)
