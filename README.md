@@ -1,4 +1,4 @@
-﻿# Context Constellation RAG
+# Context Constellation RAG
 
 A creative, portfolio-grade Retrieval-Augmented Generation project that turns a corpus into a **constellation map** of ideas.
 
@@ -85,3 +85,9 @@ This gives a lightweight demo surface for live query + evidence trace walkthroug
 - Works fully offline for retrieval and extractive answers.
 - If the sentence-transformer model cannot be downloaded, the app automatically falls back to local hashing-based vector embeddings so the full RAG flow still runs.
 - LLM synthesis is optional and never required to test the core RAG behavior.
+
+## Portfolio Positioning
+
+- Project type: Python RAG tool + optional local web UI
+- Verification path: python main.py --help and python web_app.py --help
+
