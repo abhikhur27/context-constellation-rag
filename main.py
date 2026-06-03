@@ -480,6 +480,28 @@ def command_ask(args: argparse.Namespace) -> None:
         model=args.model,
     )
 
+    if args.json_out:
+        output_path = Path(args.json_out).resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        serializable = {
+            "query": result["query"],
+            "answer": result["answer"],
+            "answer_mode": result["answer_mode"],
+            "meta": result["meta"],
+            "evidence": [
+                {
+                    "rank": row["rank"],
+                    "citation": row["citation"],
+                    "constellation": row["constellation"],
+                    "dense": row["dense"],
+                    "lex": row["lex"],
+                    "chunk": asdict(row["chunk"]),
+                }
+                for row in result["evidence"]
+            ],
+        }
+        output_path.write_text(json.dumps(serializable, indent=2), encoding="utf-8")
+
     console.print("\n[bold]Answer[/bold]")
     console.print(result["answer"])
 
@@ -513,6 +535,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ask.add_argument("--mmr-lambda", type=float, default=0.7)
     p_ask.add_argument("--llm", choices=["off", "auto", "on"], default="auto")
     p_ask.add_argument("--model", default="gpt-4.1-mini")
+    p_ask.add_argument("--json-out", help="Optional path to save the full answer + evidence payload as JSON")
     p_ask.set_defaults(func=command_ask)
 
     p_map = sub.add_parser("map", help="Show discovered constellation clusters")

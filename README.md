@@ -40,6 +40,12 @@ Ask a question:
 python main.py ask --index-dir artifacts/index --query "Where is rollout risk highest?" --top-k 6
 ```
 
+Write the answer and evidence trail to JSON for downstream tooling:
+
+```bash
+python main.py ask --index-dir artifacts/index --query "Where is rollout risk highest?" --json-out artifacts/answer.json
+```
+
 View constellation map:
 
 ```bash
