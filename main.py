@@ -380,6 +380,7 @@ def query_index(
         "answer": answer,
         "answer_mode": answer_mode,
         "evidence": selected_rows,
+        "source_count": len({row["chunk"].source for row in selected_rows}),
         "meta": payload["meta"],
     }
 
@@ -516,6 +517,7 @@ def command_ask(args: argparse.Namespace) -> None:
             "query": result["query"],
             "answer": result["answer"],
             "answer_mode": result["answer_mode"],
+            "source_count": result["source_count"],
             "meta": result["meta"],
             "evidence": [
                 {

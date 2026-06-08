@@ -46,6 +46,8 @@ Write the answer and evidence trail to JSON for downstream tooling:
 python main.py ask --index-dir artifacts/index --query "Where is rollout risk highest?" --json-out artifacts/answer.json
 ```
 
+The exported answer JSON now includes `source_count` so you can tell whether the answer is grounded in one file or spread across multiple sources.
+
 View constellation map:
 
 ```bash
