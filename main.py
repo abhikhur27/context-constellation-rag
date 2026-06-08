@@ -469,6 +469,35 @@ def command_map(args: argparse.Namespace) -> None:
         sample.add_row(chunk.chunk_id, chunk.source, chunk.text[:120] + ("..." if len(chunk.text) > 120 else ""))
     console.print(sample)
 
+    if args.json_out:
+        output_path = Path(args.json_out).resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(
+                {
+                    "index_dir": str(Path(args.index_dir).resolve()),
+                    "constellations": [
+                        {
+                            "label": f"K{label}",
+                            "chunk_count": counts[label],
+                            "theme": keywords.get(label, ["mixed"]),
+                        }
+                        for label in sorted(counts)
+                    ],
+                    "sample_chunks": [
+                        {
+                            "chunk_id": chunk.chunk_id,
+                            "source": chunk.source,
+                            "text": chunk.text,
+                        }
+                        for chunk in chunks[: min(6, len(chunks))]
+                    ],
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
 
 def command_ask(args: argparse.Namespace) -> None:
     result = query_index(
@@ -540,6 +569,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_map = sub.add_parser("map", help="Show discovered constellation clusters")
     p_map.add_argument("--index-dir", required=True)
+    p_map.add_argument("--json-out", help="Optional path to save the constellation map as JSON")
     p_map.set_defaults(func=command_map)
 
     return parser

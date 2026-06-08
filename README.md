@@ -52,6 +52,12 @@ View constellation map:
 python main.py map --index-dir artifacts/index
 ```
 
+Export the constellation map as JSON:
+
+```bash
+python main.py map --index-dir artifacts/index --json-out artifacts/map.json
+```
+
 ## Optional LLM mode
 
 If you set `OPENAI_API_KEY`, `ask` can synthesize a more natural answer:
@@ -78,6 +84,8 @@ http://127.0.0.1:7860
 ```
 
 This gives a lightweight demo surface for live query + evidence trace walkthroughs.
+
+The local UI now also supports switching retrieval depth between Top 4, Top 6, and Top 8 evidence chunks.
 
 ## Repository layout
 

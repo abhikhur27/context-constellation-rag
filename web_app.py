@@ -112,6 +112,11 @@ PAGE = """
       <p class="muted">Hybrid retrieval + evidence-first answers. Built for practical RAG portfolio demos.</p>
       <div class="query-row">
         <input id="query" value="Where is rollout risk highest and why?" />
+        <select id="top-k">
+          <option value="4">Top 4</option>
+          <option value="6" selected>Top 6</option>
+          <option value="8">Top 8</option>
+        </select>
         <select id="llm">
           <option value="off">LLM Off (Extractive)</option>
           <option value="auto">LLM Auto</option>
@@ -142,6 +147,7 @@ PAGE = """
   <script>
     const queryEl = document.getElementById('query');
     const llmEl = document.getElementById('llm');
+    const topKEl = document.getElementById('top-k');
     const askBtn = document.getElementById('ask');
     const statusEl = document.getElementById('status');
     const answerEl = document.getElementById('answer');
@@ -158,7 +164,7 @@ PAGE = """
         const resp = await fetch('/api/ask', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ query, llm: llmEl.value, top_k: 6 })
+          body: JSON.stringify({ query, llm: llmEl.value, top_k: Number(topKEl.value) })
         });
         const data = await resp.json();
         if (!resp.ok) {
@@ -179,7 +185,7 @@ PAGE = """
           evidenceEl.appendChild(tr);
         });
 
-        statusEl.textContent = `Retrieved ${data.evidence.length} evidence chunks.`;
+        statusEl.textContent = `Retrieved ${data.evidence.length} evidence chunks with Top ${topKEl.value}.`;
       } catch (error) {
         statusEl.textContent = `Error: ${error.message}`;
       } finally {
