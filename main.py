@@ -381,6 +381,14 @@ def query_index(
         "answer_mode": answer_mode,
         "evidence": selected_rows,
         "source_count": len({row["chunk"].source for row in selected_rows}),
+        "source_breakdown": {
+            source: sum(1 for row in selected_rows if row["chunk"].source == source)
+            for source in sorted({row["chunk"].source for row in selected_rows})
+        },
+        "constellation_breakdown": {
+            constellation: sum(1 for row in selected_rows if row["constellation"] == constellation)
+            for constellation in sorted({row["constellation"] for row in selected_rows})
+        },
         "meta": payload["meta"],
     }
 
@@ -518,6 +526,8 @@ def command_ask(args: argparse.Namespace) -> None:
             "answer": result["answer"],
             "answer_mode": result["answer_mode"],
             "source_count": result["source_count"],
+            "source_breakdown": result["source_breakdown"],
+            "constellation_breakdown": result["constellation_breakdown"],
             "meta": result["meta"],
             "evidence": [
                 {
@@ -535,6 +545,9 @@ def command_ask(args: argparse.Namespace) -> None:
 
     console.print("\n[bold]Answer[/bold]")
     console.print(result["answer"])
+    console.print(f"\n[bold]Source coverage[/bold] {result['source_count']} unique source(s)")
+    for source, count in result["source_breakdown"].items():
+        console.print(f"- {source}: {count} chunk(s)")
 
     trace = Table(title="Evidence Trace")
     trace.add_column("Citation")
