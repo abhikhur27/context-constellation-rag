@@ -508,6 +508,51 @@ def command_map(args: argparse.Namespace) -> None:
         )
 
 
+def write_markdown_report(result: dict[str, Any], output_path: Path) -> None:
+    evidence_lines = []
+    for row in result["evidence"]:
+        snippet = row["chunk"].text.replace("\n", " ").strip()
+        if len(snippet) > 220:
+            snippet = f"{snippet[:217]}..."
+        evidence_lines.extend(
+            [
+                f"### {row['citation']} - {row['chunk'].source}",
+                f"- Constellation: {row['constellation']}",
+                f"- Dense score: {row['dense']:.4f}",
+                f"- Lexical score: {row['lex']:.4f}",
+                f"- Snippet: {snippet}",
+                "",
+            ]
+        )
+
+    report_lines = [
+        "# Context Constellation Answer Report",
+        "",
+        f"- Query: {result['query']}",
+        f"- Answer mode: {result['answer_mode']}",
+        f"- Source coverage: {result['source_count']} unique source(s)",
+        f"- Embedding model: {result['meta'].get('embedding_model', 'unknown')}",
+        "",
+        "## Answer",
+        "",
+        result["answer"],
+        "",
+        "## Source Breakdown",
+        "",
+        *[f"- {source}: {count} chunk(s)" for source, count in result["source_breakdown"].items()],
+        "",
+        "## Constellation Breakdown",
+        "",
+        *[f"- {constellation}: {count} chunk(s)" for constellation, count in result["constellation_breakdown"].items()],
+        "",
+        "## Evidence",
+        "",
+        *evidence_lines,
+    ]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(report_lines).rstrip() + "\n", encoding="utf-8")
+
+
 def command_ask(args: argparse.Namespace) -> None:
     result = query_index(
         index_dir=Path(args.index_dir),
@@ -542,6 +587,9 @@ def command_ask(args: argparse.Namespace) -> None:
             ],
         }
         output_path.write_text(json.dumps(serializable, indent=2), encoding="utf-8")
+
+    if args.report_out:
+        write_markdown_report(result, Path(args.report_out).resolve())
 
     console.print("\n[bold]Answer[/bold]")
     console.print(result["answer"])
@@ -580,6 +628,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ask.add_argument("--llm", choices=["off", "auto", "on"], default="auto")
     p_ask.add_argument("--model", default="gpt-4.1-mini")
     p_ask.add_argument("--json-out", help="Optional path to save the full answer + evidence payload as JSON")
+    p_ask.add_argument("--report-out", help="Optional path to save a markdown analyst report with answer and evidence.")
     p_ask.set_defaults(func=command_ask)
 
     p_map = sub.add_parser("map", help="Show discovered constellation clusters")

@@ -48,6 +48,12 @@ python main.py ask --index-dir artifacts/index --query "Where is rollout risk hi
 
 The exported answer JSON now includes `source_count` so you can tell whether the answer is grounded in one file or spread across multiple sources.
 
+Write a human-readable Markdown memo instead of only console output:
+
+```bash
+python main.py ask --index-dir artifacts/index --query "Where is rollout risk highest?" --report-out artifacts/answer-report.md
+```
+
 View constellation map:
 
 ```bash
