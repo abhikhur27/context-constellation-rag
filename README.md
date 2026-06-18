@@ -47,6 +47,7 @@ python main.py ask --index-dir artifacts/index --query "Where is rollout risk hi
 ```
 
 The exported answer JSON now includes `source_count` so you can tell whether the answer is grounded in one file or spread across multiple sources.
+It now also includes `evidence_posture` so you can quickly tell whether the answer is broad, narrow, cross-supported, or concentrated in one source/constellation.
 
 Write a human-readable Markdown memo instead of only console output:
 
@@ -94,6 +95,7 @@ http://127.0.0.1:7860
 This gives a lightweight demo surface for live query + evidence trace walkthroughs.
 
 The local UI now also supports switching retrieval depth between Top 4, Top 6, and Top 8 evidence chunks.
+It also surfaces a quick evidence-coverage badge so demo viewers can tell when an answer is narrow vs broadly supported.
 
 ## Repository layout
 

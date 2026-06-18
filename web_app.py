@@ -129,7 +129,7 @@ PAGE = """
 
     <section class="panel">
       <h2>Answer</h2>
-      <p><span class="badge" id="mode">mode: -</span></p>
+      <p><span class="badge" id="mode">mode: -</span> <span class="badge" id="posture">coverage: -</span></p>
       <pre id="answer">Run a query to generate a grounded response.</pre>
     </section>
 
@@ -153,6 +153,7 @@ PAGE = """
     const answerEl = document.getElementById('answer');
     const evidenceEl = document.getElementById('evidence');
     const modeEl = document.getElementById('mode');
+    const postureEl = document.getElementById('posture');
 
     async function runAsk() {
       const query = queryEl.value.trim();
@@ -173,6 +174,7 @@ PAGE = """
 
         answerEl.textContent = data.answer;
         modeEl.textContent = `mode: ${data.answer_mode}`;
+        postureEl.textContent = `coverage: ${data.evidence_posture.coverage_label}, ${data.evidence_posture.tension_label}`;
         evidenceEl.innerHTML = '';
         data.evidence.forEach((row) => {
           const tr = document.createElement('tr');
@@ -254,6 +256,7 @@ def ask() -> tuple[dict, int] | dict:
     return {
         "answer": result["answer"],
         "answer_mode": result["answer_mode"],
+        "evidence_posture": result["evidence_posture"],
         "evidence": evidence,
     }
 

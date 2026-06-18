@@ -299,6 +299,43 @@ def build_llm_answer(query: str, selected_rows: list[dict[str, Any]], model: str
     return answer
 
 
+def build_evidence_posture(selected_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    source_counts: dict[str, int] = {}
+    constellation_counts: dict[str, int] = {}
+    for row in selected_rows:
+        source = row["chunk"].source
+        constellation = row["constellation"]
+        source_counts[source] = source_counts.get(source, 0) + 1
+        constellation_counts[constellation] = constellation_counts.get(constellation, 0) + 1
+
+    total_rows = max(1, len(selected_rows))
+    dominant_source_share = max(source_counts.values(), default=0) / total_rows
+    dominant_constellation_share = max(constellation_counts.values(), default=0) / total_rows
+
+    if len(source_counts) >= 3 and len(constellation_counts) >= 3:
+        coverage_label = "broad"
+    elif len(source_counts) >= 2 and len(constellation_counts) >= 2:
+        coverage_label = "moderate"
+    else:
+        coverage_label = "narrow"
+
+    if dominant_source_share >= 0.67 or dominant_constellation_share >= 0.67:
+        tension_label = "concentrated"
+    elif dominant_source_share <= 0.5 and dominant_constellation_share <= 0.5:
+        tension_label = "cross-supported"
+    else:
+        tension_label = "mixed"
+
+    return {
+        "coverage_label": coverage_label,
+        "tension_label": tension_label,
+        "source_count": len(source_counts),
+        "constellation_count": len(constellation_counts),
+        "dominant_source_share": round(float(dominant_source_share), 4),
+        "dominant_constellation_share": round(float(dominant_constellation_share), 4),
+    }
+
+
 def query_index(
     *,
     index_dir: Path,
@@ -375,6 +412,8 @@ def query_index(
         answer = build_extractive_answer(query, selected_rows)
         answer_mode = "extractive"
 
+    evidence_posture = build_evidence_posture(selected_rows)
+
     return {
         "query": query,
         "answer": answer,
@@ -389,6 +428,7 @@ def query_index(
             constellation: sum(1 for row in selected_rows if row["constellation"] == constellation)
             for constellation in sorted({row["constellation"] for row in selected_rows})
         },
+        "evidence_posture": evidence_posture,
         "meta": payload["meta"],
     }
 
@@ -545,6 +585,15 @@ def write_markdown_report(result: dict[str, Any], output_path: Path) -> None:
         "",
         *[f"- {constellation}: {count} chunk(s)" for constellation, count in result["constellation_breakdown"].items()],
         "",
+        "## Evidence Posture",
+        "",
+        f"- Coverage: {result['evidence_posture']['coverage_label']}",
+        f"- Tension: {result['evidence_posture']['tension_label']}",
+        f"- Source count: {result['evidence_posture']['source_count']}",
+        f"- Constellation count: {result['evidence_posture']['constellation_count']}",
+        f"- Dominant source share: {result['evidence_posture']['dominant_source_share']:.2f}",
+        f"- Dominant constellation share: {result['evidence_posture']['dominant_constellation_share']:.2f}",
+        "",
         "## Evidence",
         "",
         *evidence_lines,
@@ -573,6 +622,7 @@ def command_ask(args: argparse.Namespace) -> None:
             "source_count": result["source_count"],
             "source_breakdown": result["source_breakdown"],
             "constellation_breakdown": result["constellation_breakdown"],
+            "evidence_posture": result["evidence_posture"],
             "meta": result["meta"],
             "evidence": [
                 {
@@ -596,6 +646,10 @@ def command_ask(args: argparse.Namespace) -> None:
     console.print(f"\n[bold]Source coverage[/bold] {result['source_count']} unique source(s)")
     for source, count in result["source_breakdown"].items():
         console.print(f"- {source}: {count} chunk(s)")
+    console.print(
+        f"\n[bold]Evidence posture[/bold] {result['evidence_posture']['coverage_label']} coverage, "
+        f"{result['evidence_posture']['tension_label']} support"
+    )
 
     trace = Table(title="Evidence Trace")
     trace.add_column("Citation")
