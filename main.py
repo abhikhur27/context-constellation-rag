@@ -344,6 +344,7 @@ def query_index(
     mmr_lambda: float = 0.7,
     llm_mode: str = "auto",
     model: str = "gpt-4.1-mini",
+    source_filter: str | None = None,
 ) -> dict[str, Any]:
     payload = load_index(index_dir.resolve())
     chunks: list[Chunk] = payload["chunks"]
@@ -358,10 +359,24 @@ def query_index(
     embedder = EmbeddingEngine(model_name=model_name)
     query_vec = embedder.encode([query])[0]
 
-    dense_k = min(max(top_k * 4, top_k), len(chunks))
-    scores, idxs = dense_index.search(query_vec.reshape(1, -1), dense_k)
-    dense_scores = scores[0]
-    dense_indices = idxs[0]
+    filtered_indices = list(range(len(chunks)))
+    if source_filter:
+        pattern = re.compile(source_filter)
+        filtered_indices = [index for index, chunk in enumerate(chunks) if pattern.search(chunk.source)]
+        if not filtered_indices:
+            raise SystemExit(f"No indexed sources matched source filter: {source_filter}")
+
+    dense_k = min(max(top_k * 4, top_k), len(filtered_indices))
+    if source_filter:
+        filtered_embeddings = embeddings[filtered_indices]
+        filtered_scores = np.dot(filtered_embeddings, query_vec)
+        order = np.argsort(filtered_scores)[::-1][:dense_k]
+        dense_indices = np.asarray([filtered_indices[int(position)] for position in order], dtype=np.int32)
+        dense_scores = np.asarray([filtered_scores[int(position)] for position in order], dtype=np.float32)
+    else:
+        scores, idxs = dense_index.search(query_vec.reshape(1, -1), dense_k)
+        dense_scores = scores[0]
+        dense_indices = idxs[0]
 
     query_lex = vectorizer.transform([query])
     lex_scores_all = (lexical_matrix @ query_lex.T).toarray().ravel()
@@ -429,6 +444,7 @@ def query_index(
             for constellation in sorted({row["constellation"] for row in selected_rows})
         },
         "evidence_posture": evidence_posture,
+        "source_filter": source_filter,
         "meta": payload["meta"],
     }
 
@@ -577,6 +593,10 @@ def write_markdown_report(result: dict[str, Any], output_path: Path) -> None:
         "",
         result["answer"],
         "",
+        "## Query Scope",
+        "",
+        f"- Source filter: {result['source_filter'] or 'none'}",
+        "",
         "## Source Breakdown",
         "",
         *[f"- {source}: {count} chunk(s)" for source, count in result["source_breakdown"].items()],
@@ -610,6 +630,7 @@ def command_ask(args: argparse.Namespace) -> None:
         mmr_lambda=args.mmr_lambda,
         llm_mode=args.llm,
         model=args.model,
+        source_filter=args.source_filter,
     )
 
     if args.json_out:
@@ -623,6 +644,7 @@ def command_ask(args: argparse.Namespace) -> None:
             "source_breakdown": result["source_breakdown"],
             "constellation_breakdown": result["constellation_breakdown"],
             "evidence_posture": result["evidence_posture"],
+            "source_filter": result["source_filter"],
             "meta": result["meta"],
             "evidence": [
                 {
@@ -643,6 +665,8 @@ def command_ask(args: argparse.Namespace) -> None:
 
     console.print("\n[bold]Answer[/bold]")
     console.print(result["answer"])
+    if result["source_filter"]:
+        console.print(f"\n[bold]Source filter[/bold] {result['source_filter']}")
     console.print(f"\n[bold]Source coverage[/bold] {result['source_count']} unique source(s)")
     for source, count in result["source_breakdown"].items():
         console.print(f"- {source}: {count} chunk(s)")
@@ -681,6 +705,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ask.add_argument("--mmr-lambda", type=float, default=0.7)
     p_ask.add_argument("--llm", choices=["off", "auto", "on"], default="auto")
     p_ask.add_argument("--model", default="gpt-4.1-mini")
+    p_ask.add_argument("--source-filter", help="Optional regex applied to source paths before ranking evidence.")
     p_ask.add_argument("--json-out", help="Optional path to save the full answer + evidence payload as JSON")
     p_ask.add_argument("--report-out", help="Optional path to save a markdown analyst report with answer and evidence.")
     p_ask.set_defaults(func=command_ask)

@@ -40,6 +40,12 @@ Ask a question:
 python main.py ask --index-dir artifacts/index --query "Where is rollout risk highest?" --top-k 6
 ```
 
+Restrict retrieval to only matching source paths when you want a narrower evidence trail:
+
+```bash
+python main.py ask --index-dir artifacts/index --query "Where is rollout risk highest?" --source-filter "risk|launch"
+```
+
 Write the answer and evidence trail to JSON for downstream tooling:
 
 ```bash
@@ -48,6 +54,7 @@ python main.py ask --index-dir artifacts/index --query "Where is rollout risk hi
 
 The exported answer JSON now includes `source_count` so you can tell whether the answer is grounded in one file or spread across multiple sources.
 It now also includes `evidence_posture` so you can quickly tell whether the answer is broad, narrow, cross-supported, or concentrated in one source/constellation.
+It now also records the optional `source_filter` used for the query scope.
 
 Write a human-readable Markdown memo instead of only console output:
 
