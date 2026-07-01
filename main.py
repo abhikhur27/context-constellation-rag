@@ -534,6 +534,25 @@ def command_map(args: argparse.Namespace) -> None:
         sample.add_row(chunk.chunk_id, chunk.source, chunk.text[:120] + ("..." if len(chunk.text) > 120 else ""))
     console.print(sample)
 
+    constellation_rows = []
+    for label in sorted(counts):
+      source_counts: dict[str, int] = {}
+      for chunk, chunk_label in zip(chunks, labels.tolist()):
+          if int(chunk_label) != label:
+              continue
+          source_counts[chunk.source] = source_counts.get(chunk.source, 0) + 1
+      constellation_rows.append(
+          {
+              "label": f"K{label}",
+              "chunk_count": counts[label],
+              "theme": keywords.get(label, ["mixed"]),
+              "top_sources": [
+                  {"source": source, "chunk_count": chunk_count}
+                  for source, chunk_count in sorted(source_counts.items(), key=lambda item: (-item[1], item[0]))[:3]
+              ],
+          }
+      )
+
     if args.json_out:
         output_path = Path(args.json_out).resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -541,14 +560,7 @@ def command_map(args: argparse.Namespace) -> None:
             json.dumps(
                 {
                     "index_dir": str(Path(args.index_dir).resolve()),
-                    "constellations": [
-                        {
-                            "label": f"K{label}",
-                            "chunk_count": counts[label],
-                            "theme": keywords.get(label, ["mixed"]),
-                        }
-                        for label in sorted(counts)
-                    ],
+                    "constellations": constellation_rows,
                     "sample_chunks": [
                         {
                             "chunk_id": chunk.chunk_id,
@@ -562,6 +574,62 @@ def command_map(args: argparse.Namespace) -> None:
             ),
             encoding="utf-8",
         )
+
+    if args.report_out:
+        write_constellation_report(
+            index_dir=Path(args.index_dir).resolve(),
+            constellations=constellation_rows,
+            sample_chunks=chunks[: min(6, len(chunks))],
+            output_path=Path(args.report_out).resolve(),
+        )
+
+
+def write_constellation_report(
+    *,
+    index_dir: Path,
+    constellations: list[dict[str, Any]],
+    sample_chunks: list[Chunk],
+    output_path: Path,
+) -> None:
+    report_lines = [
+        "# Context Constellation Map Report",
+        "",
+        f"- Index: {index_dir}",
+        f"- Constellation count: {len(constellations)}",
+        f"- Sample chunk count: {len(sample_chunks)}",
+        "",
+        "## Constellations",
+        "",
+    ]
+
+    for row in constellations:
+        theme = ", ".join(row["theme"])
+        report_lines.extend(
+            [
+                f"### {row['label']}",
+                f"- Chunk count: {row['chunk_count']}",
+                f"- Theme: {theme}",
+                f"- Top sources: {', '.join(f'{entry['source']} ({entry['chunk_count']})' for entry in row['top_sources']) or 'none'}",
+                "",
+            ]
+        )
+
+    report_lines.extend(["## Sample Evidence", ""])
+    for chunk in sample_chunks:
+        snippet = chunk.text.replace("\n", " ").strip()
+        if len(snippet) > 220:
+            snippet = f"{snippet[:217]}..."
+        report_lines.extend(
+            [
+                f"### {chunk.chunk_id}",
+                f"- Source: {chunk.source}",
+                f"- Snippet: {snippet}",
+                "",
+            ]
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(report_lines).rstrip() + "\n", encoding="utf-8")
 
 
 def write_markdown_report(result: dict[str, Any], output_path: Path) -> None:
@@ -713,6 +781,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_map = sub.add_parser("map", help="Show discovered constellation clusters")
     p_map.add_argument("--index-dir", required=True)
     p_map.add_argument("--json-out", help="Optional path to save the constellation map as JSON")
+    p_map.add_argument("--report-out", help="Optional path to save a markdown constellation map report")
     p_map.set_defaults(func=command_map)
 
     return parser

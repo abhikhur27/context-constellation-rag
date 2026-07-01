@@ -74,6 +74,12 @@ Export the constellation map as JSON:
 python main.py map --index-dir artifacts/index --json-out artifacts/map.json
 ```
 
+Export the constellation map as a Markdown scouting brief:
+
+```bash
+python main.py map --index-dir artifacts/index --report-out artifacts/map-report.md
+```
+
 ## Optional LLM mode
 
 If you set `OPENAI_API_KEY`, `ask` can synthesize a more natural answer:
