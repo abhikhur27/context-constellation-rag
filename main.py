@@ -336,6 +336,47 @@ def build_evidence_posture(selected_rows: list[dict[str, Any]]) -> dict[str, Any
     }
 
 
+def build_agreement_signal(selected_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    token_counts: dict[str, int] = {}
+    for row in selected_rows:
+        text = row["chunk"].text.lower()
+        terms = {
+            term
+            for term in re.findall(r"[a-z][a-z0-9_-]{3,}", text)
+            if term not in {"that", "with", "from", "this", "have", "were", "their", "into", "they", "will"}
+        }
+        for term in terms:
+            token_counts[term] = token_counts.get(term, 0) + 1
+
+    repeated_terms = sorted(
+        (
+            {"term": term, "count": count}
+            for term, count in token_counts.items()
+            if count >= 2
+        ),
+        key=lambda item: (-item["count"], item["term"]),
+    )
+    shared_terms = [item["term"] for item in repeated_terms[:6]]
+    repeated_count = len(repeated_terms)
+
+    if repeated_count >= 6:
+        label = "aligned"
+        note = "Top evidence chunks repeat a clear core vocabulary, so the answer is converging on one main story."
+    elif repeated_count >= 3:
+        label = "partial"
+        note = "Evidence overlaps on some important terms, but the support still spans multiple adjacent angles."
+    else:
+        label = "fragmented"
+        note = "Evidence is dispersed across distinct snippets, so the answer should be treated as exploratory rather than settled."
+
+    return {
+        "label": label,
+        "shared_terms": shared_terms,
+        "repeated_term_count": repeated_count,
+        "note": note,
+    }
+
+
 def query_index(
     *,
     index_dir: Path,
@@ -428,6 +469,7 @@ def query_index(
         answer_mode = "extractive"
 
     evidence_posture = build_evidence_posture(selected_rows)
+    agreement_signal = build_agreement_signal(selected_rows)
 
     return {
         "query": query,
@@ -444,6 +486,7 @@ def query_index(
             for constellation in sorted({row["constellation"] for row in selected_rows})
         },
         "evidence_posture": evidence_posture,
+        "agreement_signal": agreement_signal,
         "source_filter": source_filter,
         "meta": payload["meta"],
     }
@@ -682,6 +725,13 @@ def write_markdown_report(result: dict[str, Any], output_path: Path) -> None:
         f"- Dominant source share: {result['evidence_posture']['dominant_source_share']:.2f}",
         f"- Dominant constellation share: {result['evidence_posture']['dominant_constellation_share']:.2f}",
         "",
+        "## Agreement Signal",
+        "",
+        f"- Label: {result['agreement_signal']['label']}",
+        f"- Shared terms: {', '.join(result['agreement_signal']['shared_terms']) or 'none'}",
+        f"- Repeated term count: {result['agreement_signal']['repeated_term_count']}",
+        f"- Note: {result['agreement_signal']['note']}",
+        "",
         "## Evidence",
         "",
         *evidence_lines,
@@ -712,6 +762,7 @@ def command_ask(args: argparse.Namespace) -> None:
             "source_breakdown": result["source_breakdown"],
             "constellation_breakdown": result["constellation_breakdown"],
             "evidence_posture": result["evidence_posture"],
+            "agreement_signal": result["agreement_signal"],
             "source_filter": result["source_filter"],
             "meta": result["meta"],
             "evidence": [
@@ -741,6 +792,10 @@ def command_ask(args: argparse.Namespace) -> None:
     console.print(
         f"\n[bold]Evidence posture[/bold] {result['evidence_posture']['coverage_label']} coverage, "
         f"{result['evidence_posture']['tension_label']} support"
+    )
+    console.print(
+        f"[bold]Agreement signal[/bold] {result['agreement_signal']['label']} "
+        f"({', '.join(result['agreement_signal']['shared_terms']) or 'no repeated terms'})"
     )
 
     trace = Table(title="Evidence Trace")

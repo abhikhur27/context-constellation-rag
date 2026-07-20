@@ -54,6 +54,7 @@ python main.py ask --index-dir artifacts/index --query "Where is rollout risk hi
 
 The exported answer JSON now includes `source_count` so you can tell whether the answer is grounded in one file or spread across multiple sources.
 It now also includes `evidence_posture` so you can quickly tell whether the answer is broad, narrow, cross-supported, or concentrated in one source/constellation.
+It now also includes an `agreement_signal` so you can tell whether the retrieved evidence is converging on one story or only loosely overlapping.
 It now also records the optional `source_filter` used for the query scope.
 
 Write a human-readable Markdown memo instead of only console output:
