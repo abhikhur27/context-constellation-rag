@@ -19,6 +19,7 @@ Instead of only returning nearest chunks, this project groups retrieved evidence
 - `index`: Build a persistent embedding + lexical index from `.txt`/`.md` files
 - `ask`: Query with hybrid retrieval and citation-grounded answer
 - `map`: Inspect the discovered constellation clusters and dominant themes
+- `evaluate`: Run a repeatable query suite and flag weak evidence patterns before demoing or iterating
 
 ## Quick start
 
@@ -81,6 +82,21 @@ Export the constellation map as a Markdown scouting brief:
 python main.py map --index-dir artifacts/index --report-out artifacts/map-report.md
 ```
 
+Run a repeatable query-suite evaluation:
+
+```bash
+python main.py evaluate --index-dir artifacts/index --queries example_queries.json --llm off
+```
+
+Export the evaluation as JSON + Markdown for a portfolio-ready validation artifact:
+
+```bash
+python main.py evaluate --index-dir artifacts/index --queries example_queries.json --llm off --json-out artifacts/test-eval.json --report-out artifacts/test-eval.md
+```
+
+Each evaluation query can be a plain string or an object with `query`, optional `label`, and optional `source_filter`.
+The evaluation summary highlights answer-mode mix, coverage posture, agreement mix, and which questions are still too narrow or single-source to trust.
+
 ## Optional LLM mode
 
 If you set `OPENAI_API_KEY`, `ask` can synthesize a more natural answer:
@@ -114,6 +130,7 @@ It also surfaces a quick evidence-coverage badge so demo viewers can tell when a
 ## Repository layout
 
 - `main.py`: end-to-end pipeline (ingest, embed, index, retrieve, answer)
+- `example_queries.json`: starter evaluation suite for batch validation
 - `web_app.py`: tiny local browser UI for query + citation trace
 - `example_corpus/`: sample documents for demo
 - `artifacts/`: generated index output
@@ -127,5 +144,5 @@ It also surfaces a quick evidence-coverage badge so demo viewers can tell when a
 ## Portfolio Positioning
 
 - Project type: Python RAG tool + optional local web UI
-- Verification path: python main.py --help and python web_app.py --help
+- Verification path: python main.py --help, python main.py evaluate --help, and python web_app.py --help
 

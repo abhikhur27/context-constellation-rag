@@ -1,0 +1,18 @@
+[
+  {
+    "label": "rollout-risk-hotspots",
+    "query": "Where is rollout risk highest and why?"
+  },
+  {
+    "label": "trustworthy-memory-sources",
+    "query": "Which memory signals look most trustworthy for retrieval tuning?"
+  },
+  {
+    "label": "governance-gaps",
+    "query": "Where do governance notes suggest the current process is weak?"
+  },
+  {
+    "label": "launch-vs-memory",
+    "query": "What tensions show up between launch posture and memory quality?"
+  }
+]

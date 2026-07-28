@@ -7,6 +7,7 @@ import pickle
 import re
 from dataclasses import dataclass, asdict
 from pathlib import Path
+from statistics import mean
 from typing import Any
 
 import faiss
@@ -377,17 +378,17 @@ def build_agreement_signal(selected_rows: list[dict[str, Any]]) -> dict[str, Any
     }
 
 
-def query_index(
+def run_query_payload(
     *,
-    index_dir: Path,
+    payload: dict[str, Any],
     query: str,
     top_k: int = 6,
     mmr_lambda: float = 0.7,
     llm_mode: str = "auto",
     model: str = "gpt-4.1-mini",
     source_filter: str | None = None,
+    embedder: EmbeddingEngine | None = None,
 ) -> dict[str, Any]:
-    payload = load_index(index_dir.resolve())
     chunks: list[Chunk] = payload["chunks"]
     embeddings: np.ndarray = payload["embeddings"]
     dense_index = payload["dense"]
@@ -397,7 +398,8 @@ def query_index(
     keywords: dict[int, list[str]] = payload["cluster_keywords"]
     model_name: str = payload["meta"]["embedding_model"]
 
-    embedder = EmbeddingEngine(model_name=model_name)
+    if embedder is None:
+        embedder = EmbeddingEngine(model_name=model_name)
     query_vec = embedder.encode([query])[0]
 
     filtered_indices = list(range(len(chunks)))
@@ -490,6 +492,28 @@ def query_index(
         "source_filter": source_filter,
         "meta": payload["meta"],
     }
+
+
+def query_index(
+    *,
+    index_dir: Path,
+    query: str,
+    top_k: int = 6,
+    mmr_lambda: float = 0.7,
+    llm_mode: str = "auto",
+    model: str = "gpt-4.1-mini",
+    source_filter: str | None = None,
+) -> dict[str, Any]:
+    payload = load_index(index_dir.resolve())
+    return run_query_payload(
+        payload=payload,
+        query=query,
+        top_k=top_k,
+        mmr_lambda=mmr_lambda,
+        llm_mode=llm_mode,
+        model=model,
+        source_filter=source_filter,
+    )
 
 
 def command_index(args: argparse.Namespace) -> None:
@@ -740,6 +764,199 @@ def write_markdown_report(result: dict[str, Any], output_path: Path) -> None:
     output_path.write_text("\n".join(report_lines).rstrip() + "\n", encoding="utf-8")
 
 
+def load_query_suite(path: Path) -> list[dict[str, Any]]:
+    raw = path.read_text(encoding="utf-8")
+    if path.suffix.lower() == ".txt":
+        queries = [line.strip() for line in raw.splitlines() if line.strip()]
+        return [{"query": query} for query in queries]
+
+    data = json.loads(raw)
+    if isinstance(data, list):
+        suite = data
+    elif isinstance(data, dict) and isinstance(data.get("queries"), list):
+        suite = data["queries"]
+    else:
+        raise SystemExit("Query suite must be a JSON array, an object with a 'queries' array, or a .txt file.")
+
+    normalized: list[dict[str, Any]] = []
+    for idx, item in enumerate(suite, start=1):
+        if isinstance(item, str):
+            normalized.append({"query": item})
+            continue
+        if not isinstance(item, dict) or not str(item.get("query", "")).strip():
+            raise SystemExit(f"Query suite entry {idx} is missing a non-empty 'query'.")
+        normalized.append(
+            {
+                "query": str(item["query"]).strip(),
+                "label": str(item.get("label", "")).strip() or None,
+                "source_filter": str(item.get("source_filter", "")).strip() or None,
+            }
+        )
+    return normalized
+
+
+def evaluate_query_suite(
+    *,
+    payload: dict[str, Any],
+    queries: list[dict[str, Any]],
+    top_k: int,
+    mmr_lambda: float,
+    llm_mode: str,
+    model: str,
+    default_source_filter: str | None,
+) -> dict[str, Any]:
+    embedder = EmbeddingEngine(model_name=payload["meta"]["embedding_model"])
+    results = []
+    posture_counts: dict[str, int] = {}
+    agreement_counts: dict[str, int] = {}
+    mode_counts: dict[str, int] = {}
+    flagged_queries = []
+
+    for idx, entry in enumerate(queries, start=1):
+        source_filter = entry.get("source_filter") or default_source_filter
+        result = run_query_payload(
+            payload=payload,
+            query=entry["query"],
+            top_k=top_k,
+            mmr_lambda=mmr_lambda,
+            llm_mode=llm_mode,
+            model=model,
+            source_filter=source_filter,
+            embedder=embedder,
+        )
+        coverage = result["evidence_posture"]["coverage_label"]
+        tension = result["evidence_posture"]["tension_label"]
+        agreement = result["agreement_signal"]["label"]
+        mode = result["answer_mode"]
+
+        mode_counts[mode] = mode_counts.get(mode, 0) + 1
+        posture_key = f"{coverage}/{tension}"
+        posture_counts[posture_key] = posture_counts.get(posture_key, 0) + 1
+        agreement_counts[agreement] = agreement_counts.get(agreement, 0) + 1
+
+        risk_flags = []
+        if coverage == "narrow":
+            risk_flags.append("narrow coverage")
+        if tension == "concentrated":
+            risk_flags.append("concentrated evidence")
+        if agreement == "fragmented":
+            risk_flags.append("fragmented agreement")
+        if result["source_count"] <= 1:
+            risk_flags.append("single-source answer")
+
+        evaluated = {
+            "query_index": idx,
+            "label": entry.get("label"),
+            "query": result["query"],
+            "answer_mode": mode,
+            "source_filter": source_filter,
+            "source_count": result["source_count"],
+            "evidence_posture": result["evidence_posture"],
+            "agreement_signal": result["agreement_signal"],
+            "source_breakdown": result["source_breakdown"],
+            "constellation_breakdown": result["constellation_breakdown"],
+            "risk_flags": risk_flags,
+            "answer_preview": result["answer"][:240].strip(),
+        }
+        results.append(evaluated)
+        if risk_flags:
+            flagged_queries.append(evaluated)
+
+    summary = {
+        "query_count": len(results),
+        "answer_mode_breakdown": mode_counts,
+        "posture_breakdown": posture_counts,
+        "agreement_breakdown": agreement_counts,
+        "avg_source_count": round(mean(item["source_count"] for item in results), 2) if results else 0.0,
+        "avg_dominant_source_share": round(
+            mean(item["evidence_posture"]["dominant_source_share"] for item in results), 4
+        )
+        if results
+        else 0.0,
+        "avg_dominant_constellation_share": round(
+            mean(item["evidence_posture"]["dominant_constellation_share"] for item in results), 4
+        )
+        if results
+        else 0.0,
+        "flagged_query_count": len(flagged_queries),
+    }
+
+    return {
+        "summary": summary,
+        "results": results,
+        "flagged_queries": flagged_queries,
+    }
+
+
+def write_evaluation_report(
+    *,
+    evaluation: dict[str, Any],
+    query_suite_path: Path,
+    index_dir: Path,
+    output_path: Path,
+) -> None:
+    summary = evaluation["summary"]
+    lines = [
+        "# Context Constellation Evaluation Report",
+        "",
+        f"- Query suite: {query_suite_path}",
+        f"- Index: {index_dir}",
+        f"- Query count: {summary['query_count']}",
+        f"- Flagged queries: {summary['flagged_query_count']}",
+        f"- Average source count: {summary['avg_source_count']}",
+        f"- Average dominant source share: {summary['avg_dominant_source_share']:.2f}",
+        f"- Average dominant constellation share: {summary['avg_dominant_constellation_share']:.2f}",
+        "",
+        "## Answer Modes",
+        "",
+        *[f"- {mode}: {count}" for mode, count in sorted(summary["answer_mode_breakdown"].items())],
+        "",
+        "## Evidence Posture Mix",
+        "",
+        *[f"- {posture}: {count}" for posture, count in sorted(summary["posture_breakdown"].items())],
+        "",
+        "## Agreement Mix",
+        "",
+        *[f"- {label}: {count}" for label, count in sorted(summary["agreement_breakdown"].items())],
+        "",
+    ]
+
+    if evaluation["flagged_queries"]:
+        lines.extend(["## Review First", ""])
+        for item in evaluation["flagged_queries"]:
+            lines.extend(
+                [
+                    f"### Q{item['query_index']}: {item['label'] or item['query']}",
+                    f"- Query: {item['query']}",
+                    f"- Flags: {', '.join(item['risk_flags'])}",
+                    f"- Posture: {item['evidence_posture']['coverage_label']} / {item['evidence_posture']['tension_label']}",
+                    f"- Agreement: {item['agreement_signal']['label']}",
+                    f"- Sources: {', '.join(f'{source} ({count})' for source, count in item['source_breakdown'].items())}",
+                    "",
+                ]
+            )
+
+    lines.extend(["## Query Results", ""])
+    for item in evaluation["results"]:
+        lines.extend(
+            [
+                f"### Q{item['query_index']}: {item['label'] or item['query']}",
+                f"- Query: {item['query']}",
+                f"- Answer mode: {item['answer_mode']}",
+                f"- Source filter: {item['source_filter'] or 'none'}",
+                f"- Sources: {item['source_count']}",
+                f"- Posture: {item['evidence_posture']['coverage_label']} / {item['evidence_posture']['tension_label']}",
+                f"- Agreement: {item['agreement_signal']['label']}",
+                f"- Risk flags: {', '.join(item['risk_flags']) or 'none'}",
+                f"- Answer preview: {item['answer_preview']}",
+                "",
+            ]
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
 def command_ask(args: argparse.Namespace) -> None:
     result = query_index(
         index_dir=Path(args.index_dir),
@@ -809,6 +1026,66 @@ def command_ask(args: argparse.Namespace) -> None:
     console.print(trace)
 
 
+def command_evaluate(args: argparse.Namespace) -> None:
+    index_dir = Path(args.index_dir).resolve()
+    query_suite_path = Path(args.queries).resolve()
+    payload = load_index(index_dir)
+    query_suite = load_query_suite(query_suite_path)
+    evaluation = evaluate_query_suite(
+        payload=payload,
+        queries=query_suite,
+        top_k=args.top_k,
+        mmr_lambda=args.mmr_lambda,
+        llm_mode=args.llm,
+        model=args.model,
+        default_source_filter=args.source_filter,
+    )
+
+    summary = evaluation["summary"]
+    table = Table(title="Evaluation Summary")
+    table.add_column("Metric")
+    table.add_column("Value")
+    table.add_row("Queries", str(summary["query_count"]))
+    table.add_row("Flagged", str(summary["flagged_query_count"]))
+    table.add_row("Avg sources", str(summary["avg_source_count"]))
+    table.add_row("Avg dominant source share", f"{summary['avg_dominant_source_share']:.2f}")
+    table.add_row("Avg dominant constellation share", f"{summary['avg_dominant_constellation_share']:.2f}")
+    console.print(table)
+
+    console.print("\n[bold]Answer modes[/bold]")
+    for mode, count in sorted(summary["answer_mode_breakdown"].items()):
+        console.print(f"- {mode}: {count}")
+
+    console.print("\n[bold]Evidence posture mix[/bold]")
+    for posture, count in sorted(summary["posture_breakdown"].items()):
+        console.print(f"- {posture}: {count}")
+
+    console.print("\n[bold]Agreement mix[/bold]")
+    for label, count in sorted(summary["agreement_breakdown"].items()):
+        console.print(f"- {label}: {count}")
+
+    if evaluation["flagged_queries"]:
+        console.print("\n[bold]Flagged queries[/bold]")
+        for item in evaluation["flagged_queries"]:
+            console.print(
+                f"- Q{item['query_index']} {item['label'] or item['query']}: "
+                f"{', '.join(item['risk_flags'])}"
+            )
+
+    if args.json_out:
+        output_path = Path(args.json_out).resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(evaluation, indent=2), encoding="utf-8")
+
+    if args.report_out:
+        write_evaluation_report(
+            evaluation=evaluation,
+            query_suite_path=query_suite_path,
+            index_dir=index_dir,
+            output_path=Path(args.report_out).resolve(),
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Context Constellation RAG")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -838,6 +1115,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_map.add_argument("--json-out", help="Optional path to save the constellation map as JSON")
     p_map.add_argument("--report-out", help="Optional path to save a markdown constellation map report")
     p_map.set_defaults(func=command_map)
+
+    p_eval = sub.add_parser("evaluate", help="Run a repeatable batch evaluation over a query suite")
+    p_eval.add_argument("--index-dir", required=True)
+    p_eval.add_argument("--queries", required=True, help="Path to a .json/.txt query suite")
+    p_eval.add_argument("--top-k", type=int, default=6)
+    p_eval.add_argument("--mmr-lambda", type=float, default=0.7)
+    p_eval.add_argument("--llm", choices=["off", "auto", "on"], default="auto")
+    p_eval.add_argument("--model", default="gpt-4.1-mini")
+    p_eval.add_argument("--source-filter", help="Optional default regex applied to source paths for every query.")
+    p_eval.add_argument("--json-out", help="Optional path to save evaluation results as JSON")
+    p_eval.add_argument("--report-out", help="Optional path to save a markdown evaluation report")
+    p_eval.set_defaults(func=command_evaluate)
 
     return parser
 
