@@ -19,7 +19,7 @@ Instead of only returning nearest chunks, this project groups retrieved evidence
 - `index`: Build a persistent embedding + lexical index from `.txt`/`.md` files
 - `ask`: Query with hybrid retrieval and citation-grounded answer
 - `map`: Inspect the discovered constellation clusters and dominant themes
-- `evaluate`: Run a repeatable query suite and flag weak evidence patterns before demoing or iterating
+- `evaluate`: Run a repeatable query suite, check paraphrase stability, and flag weak evidence patterns before demoing or iterating
 
 ## Quick start
 
@@ -94,8 +94,31 @@ Export the evaluation as JSON + Markdown for a portfolio-ready validation artifa
 python main.py evaluate --index-dir artifacts/index --queries example_queries.json --llm off --json-out artifacts/test-eval.json --report-out artifacts/test-eval.md
 ```
 
-Each evaluation query can be a plain string or an object with `query`, optional `label`, and optional `source_filter`.
-The evaluation summary highlights answer-mode mix, coverage posture, agreement mix, and which questions are still too narrow or single-source to trust.
+Each evaluation query can be a plain string or an object with `query`, optional `label`, optional `source_filter`, optional `expected_sources`, and optional `variants`.
+Use `expected_sources` to declare regex patterns over source paths that should show up in the evidence trail, and `variants` to provide alternate phrasings that stress-test retrieval stability.
+The evaluation summary now highlights answer-mode mix, coverage posture, agreement mix, expected-source misses, and whether a question stays stable across paraphrases or turns brittle under rewording.
+
+Example evaluation entry:
+
+```json
+{
+  "label": "launch-vs-memory",
+  "query": "What tensions show up between launch posture and memory quality?",
+  "expected_sources": ["rollout_posture", "memory_signals"],
+  "variants": [
+    {
+      "label": "cross-source-tension-angle",
+      "query": "Where do launch plans and memory-quality notes conflict with each other?"
+    }
+  ]
+}
+```
+
+Evaluation outputs now include:
+
+- variant stability averages for source, constellation, and chunk overlap
+- per-query `variant-sensitive retrieval` flags when paraphrases pull the evidence trail apart
+- per-query expected-source gaps when important document families disappear from the answer
 
 ## Optional LLM mode
 
@@ -130,7 +153,7 @@ It also surfaces a quick evidence-coverage badge so demo viewers can tell when a
 ## Repository layout
 
 - `main.py`: end-to-end pipeline (ingest, embed, index, retrieve, answer)
-- `example_queries.json`: starter evaluation suite for batch validation
+- `example_queries.json`: starter evaluation suite with source expectations and paraphrase variants
 - `web_app.py`: tiny local browser UI for query + citation trace
 - `example_corpus/`: sample documents for demo
 - `artifacts/`: generated index output

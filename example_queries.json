@@ -1,18 +1,50 @@
 [
   {
     "label": "rollout-risk-hotspots",
-    "query": "Where is rollout risk highest and why?"
+    "query": "Where is rollout risk highest and why?",
+    "expected_sources": ["rollout_posture", "governance_notes"],
+    "variants": [
+      {
+        "label": "launch-readiness-angle",
+        "query": "Which launch areas look riskiest right now?"
+      },
+      {
+        "label": "risk-register-angle",
+        "query": "What evidence points to the highest rollout risk zones?"
+      }
+    ]
   },
   {
     "label": "trustworthy-memory-sources",
-    "query": "Which memory signals look most trustworthy for retrieval tuning?"
+    "query": "Which memory signals look most trustworthy for retrieval tuning?",
+    "expected_sources": ["memory_signals"],
+    "variants": [
+      {
+        "label": "retrieval-tuning-angle",
+        "query": "Which memory evidence should we trust most when tuning retrieval?"
+      }
+    ]
   },
   {
     "label": "governance-gaps",
-    "query": "Where do governance notes suggest the current process is weak?"
+    "query": "Where do governance notes suggest the current process is weak?",
+    "expected_sources": ["governance_notes"],
+    "variants": [
+      {
+        "label": "process-breakdown-angle",
+        "query": "What do the governance notes say is breaking down in the current process?"
+      }
+    ]
   },
   {
     "label": "launch-vs-memory",
-    "query": "What tensions show up between launch posture and memory quality?"
+    "query": "What tensions show up between launch posture and memory quality?",
+    "expected_sources": ["rollout_posture", "memory_signals"],
+    "variants": [
+      {
+        "label": "cross-source-tension-angle",
+        "query": "Where do launch plans and memory-quality notes conflict with each other?"
+      }
+    ]
   }
 ]

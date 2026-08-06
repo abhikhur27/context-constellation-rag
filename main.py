@@ -378,6 +378,112 @@ def build_agreement_signal(selected_rows: list[dict[str, Any]]) -> dict[str, Any
     }
 
 
+def chunk_id_set(result: dict[str, Any]) -> set[str]:
+    return {row["chunk"].chunk_id for row in result["evidence"]}
+
+
+def source_set(result: dict[str, Any]) -> set[str]:
+    return set(result["source_breakdown"].keys())
+
+
+def constellation_set(result: dict[str, Any]) -> set[str]:
+    return set(result["constellation_breakdown"].keys())
+
+
+def compute_set_overlap(left: set[str], right: set[str]) -> float:
+    if not left and not right:
+        return 1.0
+    union = left | right
+    if not union:
+        return 1.0
+    return round(len(left & right) / len(union), 4)
+
+
+def build_variant_stability_summary(
+    primary_result: dict[str, Any],
+    variant_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not variant_results:
+        return {
+            "variant_count": 0,
+            "stable": None,
+            "avg_source_overlap": None,
+            "avg_constellation_overlap": None,
+            "avg_chunk_overlap": None,
+            "posture_mismatch_count": 0,
+            "agreement_mismatch_count": 0,
+            "details": [],
+        }
+
+    primary_sources = source_set(primary_result)
+    primary_constellations = constellation_set(primary_result)
+    primary_chunks = chunk_id_set(primary_result)
+    primary_posture = primary_result["evidence_posture"]
+    primary_agreement = primary_result["agreement_signal"]["label"]
+    details = []
+
+    for variant in variant_results:
+        variant_sources = source_set(variant["result"])
+        variant_constellations = constellation_set(variant["result"])
+        variant_chunks = chunk_id_set(variant["result"])
+        details.append(
+            {
+                "label": variant["label"],
+                "query": variant["query"],
+                "source_filter": variant["source_filter"],
+                "source_overlap": compute_set_overlap(primary_sources, variant_sources),
+                "constellation_overlap": compute_set_overlap(primary_constellations, variant_constellations),
+                "chunk_overlap": compute_set_overlap(primary_chunks, variant_chunks),
+                "posture_match": (
+                    primary_posture["coverage_label"] == variant["result"]["evidence_posture"]["coverage_label"]
+                    and primary_posture["tension_label"] == variant["result"]["evidence_posture"]["tension_label"]
+                ),
+                "agreement_match": primary_agreement == variant["result"]["agreement_signal"]["label"],
+                "source_count": variant["result"]["source_count"],
+            }
+        )
+
+    avg_source_overlap = round(mean(item["source_overlap"] for item in details), 4)
+    avg_constellation_overlap = round(mean(item["constellation_overlap"] for item in details), 4)
+    avg_chunk_overlap = round(mean(item["chunk_overlap"] for item in details), 4)
+    posture_mismatch_count = sum(1 for item in details if not item["posture_match"])
+    agreement_mismatch_count = sum(1 for item in details if not item["agreement_match"])
+    stable = (
+        avg_source_overlap >= 0.5
+        and avg_constellation_overlap >= 0.5
+        and posture_mismatch_count == 0
+        and agreement_mismatch_count <= 1
+    )
+
+    return {
+        "variant_count": len(details),
+        "stable": stable,
+        "avg_source_overlap": avg_source_overlap,
+        "avg_constellation_overlap": avg_constellation_overlap,
+        "avg_chunk_overlap": avg_chunk_overlap,
+        "posture_mismatch_count": posture_mismatch_count,
+        "agreement_mismatch_count": agreement_mismatch_count,
+        "details": details,
+    }
+
+
+def find_expected_source_matches(
+    *,
+    expected_sources: list[str],
+    observed_sources: set[str],
+) -> dict[str, Any]:
+    matched: list[str] = []
+    missing: list[str] = []
+    for pattern_text in expected_sources:
+        pattern = re.compile(pattern_text)
+        pattern_matches = sorted(source for source in observed_sources if pattern.search(source))
+        if pattern_matches:
+            matched.append(pattern_text)
+        else:
+            missing.append(pattern_text)
+    return {"matched": matched, "missing": missing}
+
+
 def run_query_payload(
     *,
     payload: dict[str, Any],
@@ -790,6 +896,20 @@ def load_query_suite(path: Path) -> list[dict[str, Any]]:
                 "query": str(item["query"]).strip(),
                 "label": str(item.get("label", "")).strip() or None,
                 "source_filter": str(item.get("source_filter", "")).strip() or None,
+                "expected_sources": [
+                    str(source).strip()
+                    for source in item.get("expected_sources", [])
+                    if str(source).strip()
+                ],
+                "variants": [
+                    {
+                        "query": str(variant["query"]).strip(),
+                        "label": str(variant.get("label", "")).strip() or None,
+                        "source_filter": str(variant.get("source_filter", "")).strip() or None,
+                    }
+                    for variant in item.get("variants", [])
+                    if isinstance(variant, dict) and str(variant.get("query", "")).strip()
+                ],
             }
         )
     return normalized
@@ -844,17 +964,55 @@ def evaluate_query_suite(
         if result["source_count"] <= 1:
             risk_flags.append("single-source answer")
 
+        expected_sources = entry.get("expected_sources") or []
+        expected_source_matches = find_expected_source_matches(
+            expected_sources=expected_sources,
+            observed_sources=source_set(result),
+        )
+        if expected_source_matches["missing"]:
+            risk_flags.append("missed expected sources")
+
+        variant_results = []
+        for variant_idx, variant in enumerate(entry.get("variants") or [], start=1):
+            variant_source_filter = variant.get("source_filter") or source_filter
+            variant_result = run_query_payload(
+                payload=payload,
+                query=variant["query"],
+                top_k=top_k,
+                mmr_lambda=mmr_lambda,
+                llm_mode=llm_mode,
+                model=model,
+                source_filter=variant_source_filter,
+                embedder=embedder,
+            )
+            variant_results.append(
+                {
+                    "variant_index": variant_idx,
+                    "label": variant.get("label") or f"variant-{variant_idx}",
+                    "query": variant_result["query"],
+                    "source_filter": variant_source_filter,
+                    "result": variant_result,
+                }
+            )
+
+        variant_stability = build_variant_stability_summary(result, variant_results)
+        if variant_stability["variant_count"] and not variant_stability["stable"]:
+            risk_flags.append("variant-sensitive retrieval")
+
         evaluated = {
             "query_index": idx,
             "label": entry.get("label"),
             "query": result["query"],
             "answer_mode": mode,
             "source_filter": source_filter,
+            "expected_sources": expected_sources,
+            "expected_source_matches": expected_source_matches,
             "source_count": result["source_count"],
             "evidence_posture": result["evidence_posture"],
             "agreement_signal": result["agreement_signal"],
             "source_breakdown": result["source_breakdown"],
             "constellation_breakdown": result["constellation_breakdown"],
+            "variant_stability": variant_stability,
             "risk_flags": risk_flags,
             "answer_preview": result["answer"][:240].strip(),
         }
@@ -879,6 +1037,32 @@ def evaluate_query_suite(
         if results
         else 0.0,
         "flagged_query_count": len(flagged_queries),
+        "variant_query_count": sum(1 for item in results if item["variant_stability"]["variant_count"]),
+        "stable_variant_query_count": sum(
+            1
+            for item in results
+            if item["variant_stability"]["variant_count"] and item["variant_stability"]["stable"]
+        ),
+        "avg_variant_source_overlap": round(
+            mean(
+                item["variant_stability"]["avg_source_overlap"]
+                for item in results
+                if item["variant_stability"]["avg_source_overlap"] is not None
+            ),
+            4,
+        )
+        if any(item["variant_stability"]["avg_source_overlap"] is not None for item in results)
+        else 0.0,
+        "avg_variant_constellation_overlap": round(
+            mean(
+                item["variant_stability"]["avg_constellation_overlap"]
+                for item in results
+                if item["variant_stability"]["avg_constellation_overlap"] is not None
+            ),
+            4,
+        )
+        if any(item["variant_stability"]["avg_constellation_overlap"] is not None for item in results)
+        else 0.0,
     }
 
     return {
@@ -906,6 +1090,10 @@ def write_evaluation_report(
         f"- Average source count: {summary['avg_source_count']}",
         f"- Average dominant source share: {summary['avg_dominant_source_share']:.2f}",
         f"- Average dominant constellation share: {summary['avg_dominant_constellation_share']:.2f}",
+        f"- Queries with variants: {summary['variant_query_count']}",
+        f"- Stable variant queries: {summary['stable_variant_query_count']}",
+        f"- Average variant source overlap: {summary['avg_variant_source_overlap']:.2f}",
+        f"- Average variant constellation overlap: {summary['avg_variant_constellation_overlap']:.2f}",
         "",
         "## Answer Modes",
         "",
@@ -932,6 +1120,15 @@ def write_evaluation_report(
                     f"- Posture: {item['evidence_posture']['coverage_label']} / {item['evidence_posture']['tension_label']}",
                     f"- Agreement: {item['agreement_signal']['label']}",
                     f"- Sources: {', '.join(f'{source} ({count})' for source, count in item['source_breakdown'].items())}",
+                    f"- Expected source gaps: {', '.join(item['expected_source_matches']['missing']) or 'none'}",
+                    (
+                        "- Variant stability: "
+                        f"{'stable' if item['variant_stability']['stable'] else 'unstable'} "
+                        f"(source overlap {item['variant_stability']['avg_source_overlap']:.2f}, "
+                        f"constellation overlap {item['variant_stability']['avg_constellation_overlap']:.2f})"
+                    )
+                    if item["variant_stability"]["variant_count"]
+                    else "- Variant stability: not evaluated",
                     "",
                 ]
             )
@@ -944,14 +1141,36 @@ def write_evaluation_report(
                 f"- Query: {item['query']}",
                 f"- Answer mode: {item['answer_mode']}",
                 f"- Source filter: {item['source_filter'] or 'none'}",
+                f"- Expected sources: {', '.join(item['expected_sources']) or 'none'}",
                 f"- Sources: {item['source_count']}",
                 f"- Posture: {item['evidence_posture']['coverage_label']} / {item['evidence_posture']['tension_label']}",
                 f"- Agreement: {item['agreement_signal']['label']}",
                 f"- Risk flags: {', '.join(item['risk_flags']) or 'none'}",
+                f"- Expected source gaps: {', '.join(item['expected_source_matches']['missing']) or 'none'}",
                 f"- Answer preview: {item['answer_preview']}",
                 "",
             ]
         )
+        if item["variant_stability"]["variant_count"]:
+            lines.extend(
+                [
+                    "#### Variant Stability",
+                    f"- Stable: {'yes' if item['variant_stability']['stable'] else 'no'}",
+                    f"- Average source overlap: {item['variant_stability']['avg_source_overlap']:.2f}",
+                    f"- Average constellation overlap: {item['variant_stability']['avg_constellation_overlap']:.2f}",
+                    f"- Average chunk overlap: {item['variant_stability']['avg_chunk_overlap']:.2f}",
+                    f"- Posture mismatches: {item['variant_stability']['posture_mismatch_count']}",
+                    f"- Agreement mismatches: {item['variant_stability']['agreement_mismatch_count']}",
+                    "",
+                ]
+            )
+            for variant in item["variant_stability"]["details"]:
+                lines.extend(
+                    [
+                        f"- {variant['label']}: source overlap {variant['source_overlap']:.2f}, constellation overlap {variant['constellation_overlap']:.2f}, chunk overlap {variant['chunk_overlap']:.2f}, posture match {'yes' if variant['posture_match'] else 'no'}, agreement match {'yes' if variant['agreement_match'] else 'no'}",
+                    ]
+                )
+            lines.append("")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
@@ -1050,6 +1269,10 @@ def command_evaluate(args: argparse.Namespace) -> None:
     table.add_row("Avg sources", str(summary["avg_source_count"]))
     table.add_row("Avg dominant source share", f"{summary['avg_dominant_source_share']:.2f}")
     table.add_row("Avg dominant constellation share", f"{summary['avg_dominant_constellation_share']:.2f}")
+    table.add_row("Queries with variants", str(summary["variant_query_count"]))
+    table.add_row("Stable variant queries", str(summary["stable_variant_query_count"]))
+    table.add_row("Avg variant source overlap", f"{summary['avg_variant_source_overlap']:.2f}")
+    table.add_row("Avg variant constellation overlap", f"{summary['avg_variant_constellation_overlap']:.2f}")
     console.print(table)
 
     console.print("\n[bold]Answer modes[/bold]")
