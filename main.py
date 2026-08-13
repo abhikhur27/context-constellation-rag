@@ -97,6 +97,17 @@ class EmbeddingEngine:
         self.fallback_vectorizer: HashingVectorizer | None = None
         self.dim = 1024
 
+        if model_name in {"hashing", "hashing-fallback"}:
+            self.mode = "hashing"
+            self.fallback_vectorizer = HashingVectorizer(
+                analyzer="char_wb",
+                ngram_range=(3, 5),
+                n_features=self.dim,
+                alternate_sign=False,
+                norm=None,
+            )
+            return
+
         try:
             from sentence_transformers import SentenceTransformer
 
@@ -440,6 +451,12 @@ def build_variant_stability_summary(
                 ),
                 "agreement_match": primary_agreement == variant["result"]["agreement_signal"]["label"],
                 "source_count": variant["result"]["source_count"],
+                "expected_source_recall": variant.get("expected_source_metrics", {}).get("recall_at_k"),
+                "missing_expected_sources": [
+                    item["pattern"]
+                    for item in variant.get("expected_source_metrics", {}).get("details", [])
+                    if item["best_rank"] is None
+                ],
             }
         )
 
@@ -475,13 +492,90 @@ def find_expected_source_matches(
     matched: list[str] = []
     missing: list[str] = []
     for pattern_text in expected_sources:
-        pattern = re.compile(pattern_text)
+        try:
+            pattern = re.compile(pattern_text)
+        except re.error as exc:
+            raise SystemExit(f"Invalid expected source regex {pattern_text!r}: {exc}") from exc
         pattern_matches = sorted(source for source in observed_sources if pattern.search(source))
         if pattern_matches:
             matched.append(pattern_text)
         else:
             missing.append(pattern_text)
     return {"matched": matched, "missing": missing}
+
+
+def build_expected_source_metrics(
+    *,
+    expected_sources: list[str],
+    evidence: list[dict[str, Any]],
+) -> dict[str, Any]:
+    details = []
+    for pattern_text in expected_sources:
+        try:
+            pattern = re.compile(pattern_text)
+        except re.error as exc:
+            raise SystemExit(f"Invalid expected source regex {pattern_text!r}: {exc}") from exc
+
+        matching_rows = [row for row in evidence if pattern.search(row["chunk"].source)]
+        best_rank = min((int(row["rank"]) for row in matching_rows), default=None)
+        details.append(
+            {
+                "pattern": pattern_text,
+                "matched_sources": sorted({row["chunk"].source for row in matching_rows}),
+                "best_rank": best_rank,
+                "reciprocal_rank": round(1.0 / best_rank, 4) if best_rank else 0.0,
+            }
+        )
+
+    expected_count = len(details)
+    matched_count = sum(1 for item in details if item["best_rank"] is not None)
+    return {
+        "expected_count": expected_count,
+        "matched_count": matched_count,
+        "recall_at_k": round(matched_count / expected_count, 4) if expected_count else None,
+        "mean_reciprocal_rank": (
+            round(mean(item["reciprocal_rank"] for item in details), 4) if details else None
+        ),
+        "details": details,
+    }
+
+
+def build_quality_gate(
+    *,
+    summary: dict[str, Any],
+    min_expected_source_recall: float | None = None,
+    min_expected_source_mrr: float | None = None,
+    min_variant_stability_rate: float | None = None,
+    max_flagged_query_rate: float | None = None,
+) -> dict[str, Any]:
+    configured = [
+        ("expected source recall", "expected_source_recall", min_expected_source_recall, ">="),
+        ("expected source MRR", "expected_source_mrr", min_expected_source_mrr, ">="),
+        ("variant stability rate", "variant_stability_rate", min_variant_stability_rate, ">="),
+        ("flagged query rate", "flagged_query_rate", max_flagged_query_rate, "<="),
+    ]
+    checks = []
+    for label, metric, threshold, comparator in configured:
+        if threshold is None:
+            continue
+        actual = summary[metric]
+        passed = actual >= threshold if comparator == ">=" else actual <= threshold
+        checks.append(
+            {
+                "label": label,
+                "metric": metric,
+                "actual": actual,
+                "comparator": comparator,
+                "threshold": threshold,
+                "passed": passed,
+            }
+        )
+
+    return {
+        "configured": bool(checks),
+        "passed": all(check["passed"] for check in checks),
+        "checks": checks,
+    }
 
 
 def run_query_payload(
@@ -931,6 +1025,7 @@ def evaluate_query_suite(
     agreement_counts: dict[str, int] = {}
     mode_counts: dict[str, int] = {}
     flagged_queries = []
+    expected_metric_runs: list[dict[str, Any]] = []
 
     for idx, entry in enumerate(queries, start=1):
         source_filter = entry.get("source_filter") or default_source_filter
@@ -969,6 +1064,12 @@ def evaluate_query_suite(
             expected_sources=expected_sources,
             observed_sources=source_set(result),
         )
+        expected_source_metrics = build_expected_source_metrics(
+            expected_sources=expected_sources,
+            evidence=result["evidence"],
+        )
+        if expected_sources:
+            expected_metric_runs.append(expected_source_metrics)
         if expected_source_matches["missing"]:
             risk_flags.append("missed expected sources")
 
@@ -985,6 +1086,12 @@ def evaluate_query_suite(
                 source_filter=variant_source_filter,
                 embedder=embedder,
             )
+            variant_expected_source_metrics = build_expected_source_metrics(
+                expected_sources=expected_sources,
+                evidence=variant_result["evidence"],
+            )
+            if expected_sources:
+                expected_metric_runs.append(variant_expected_source_metrics)
             variant_results.append(
                 {
                     "variant_index": variant_idx,
@@ -992,12 +1099,15 @@ def evaluate_query_suite(
                     "query": variant_result["query"],
                     "source_filter": variant_source_filter,
                     "result": variant_result,
+                    "expected_source_metrics": variant_expected_source_metrics,
                 }
             )
 
         variant_stability = build_variant_stability_summary(result, variant_results)
         if variant_stability["variant_count"] and not variant_stability["stable"]:
             risk_flags.append("variant-sensitive retrieval")
+        if any(item["missing_expected_sources"] for item in variant_stability["details"]):
+            risk_flags.append("variant missed expected sources")
 
         evaluated = {
             "query_index": idx,
@@ -1007,6 +1117,7 @@ def evaluate_query_suite(
             "source_filter": source_filter,
             "expected_sources": expected_sources,
             "expected_source_matches": expected_source_matches,
+            "expected_source_metrics": expected_source_metrics,
             "source_count": result["source_count"],
             "evidence_posture": result["evidence_posture"],
             "agreement_signal": result["agreement_signal"],
@@ -1019,6 +1130,20 @@ def evaluate_query_suite(
         results.append(evaluated)
         if risk_flags:
             flagged_queries.append(evaluated)
+
+    expected_pattern_count = sum(item["expected_count"] for item in expected_metric_runs)
+    expected_pattern_match_count = sum(item["matched_count"] for item in expected_metric_runs)
+    expected_reciprocal_ranks = [
+        detail["reciprocal_rank"]
+        for run in expected_metric_runs
+        for detail in run["details"]
+    ]
+    variant_query_count = sum(1 for item in results if item["variant_stability"]["variant_count"])
+    stable_variant_query_count = sum(
+        1
+        for item in results
+        if item["variant_stability"]["variant_count"] and item["variant_stability"]["stable"]
+    )
 
     summary = {
         "query_count": len(results),
@@ -1037,11 +1162,20 @@ def evaluate_query_suite(
         if results
         else 0.0,
         "flagged_query_count": len(flagged_queries),
-        "variant_query_count": sum(1 for item in results if item["variant_stability"]["variant_count"]),
-        "stable_variant_query_count": sum(
-            1
-            for item in results
-            if item["variant_stability"]["variant_count"] and item["variant_stability"]["stable"]
+        "flagged_query_rate": round(len(flagged_queries) / len(results), 4) if results else 0.0,
+        "expected_source_case_count": len(expected_metric_runs),
+        "expected_source_pattern_count": expected_pattern_count,
+        "expected_source_pattern_match_count": expected_pattern_match_count,
+        "expected_source_recall": (
+            round(expected_pattern_match_count / expected_pattern_count, 4)
+            if expected_pattern_count
+            else 0.0
+        ),
+        "expected_source_mrr": round(mean(expected_reciprocal_ranks), 4) if expected_reciprocal_ranks else 0.0,
+        "variant_query_count": variant_query_count,
+        "stable_variant_query_count": stable_variant_query_count,
+        "variant_stability_rate": (
+            round(stable_variant_query_count / variant_query_count, 4) if variant_query_count else 0.0
         ),
         "avg_variant_source_overlap": round(
             mean(
@@ -1087,11 +1221,14 @@ def write_evaluation_report(
         f"- Index: {index_dir}",
         f"- Query count: {summary['query_count']}",
         f"- Flagged queries: {summary['flagged_query_count']}",
+        f"- Expected source recall: {summary['expected_source_recall']:.2f}",
+        f"- Expected source MRR: {summary['expected_source_mrr']:.2f}",
         f"- Average source count: {summary['avg_source_count']}",
         f"- Average dominant source share: {summary['avg_dominant_source_share']:.2f}",
         f"- Average dominant constellation share: {summary['avg_dominant_constellation_share']:.2f}",
         f"- Queries with variants: {summary['variant_query_count']}",
         f"- Stable variant queries: {summary['stable_variant_query_count']}",
+        f"- Variant stability rate: {summary['variant_stability_rate']:.2f}",
         f"- Average variant source overlap: {summary['avg_variant_source_overlap']:.2f}",
         f"- Average variant constellation overlap: {summary['avg_variant_constellation_overlap']:.2f}",
         "",
@@ -1109,6 +1246,22 @@ def write_evaluation_report(
         "",
     ]
 
+    quality_gate = evaluation.get("quality_gate")
+    if quality_gate and quality_gate["configured"]:
+        lines.extend(
+            [
+                "## Quality Gate",
+                "",
+                f"- Result: {'PASS' if quality_gate['passed'] else 'FAIL'}",
+                *[
+                    f"- {'PASS' if check['passed'] else 'FAIL'}: {check['label']} "
+                    f"{check['actual']:.2f} {check['comparator']} {check['threshold']:.2f}"
+                    for check in quality_gate["checks"]
+                ],
+                "",
+            ]
+        )
+
     if evaluation["flagged_queries"]:
         lines.extend(["## Review First", ""])
         for item in evaluation["flagged_queries"]:
@@ -1121,6 +1274,7 @@ def write_evaluation_report(
                     f"- Agreement: {item['agreement_signal']['label']}",
                     f"- Sources: {', '.join(f'{source} ({count})' for source, count in item['source_breakdown'].items())}",
                     f"- Expected source gaps: {', '.join(item['expected_source_matches']['missing']) or 'none'}",
+                    f"- Expected source recall: {item['expected_source_metrics']['recall_at_k'] if item['expected_source_metrics']['recall_at_k'] is not None else 'not evaluated'}",
                     (
                         "- Variant stability: "
                         f"{'stable' if item['variant_stability']['stable'] else 'unstable'} "
@@ -1147,6 +1301,8 @@ def write_evaluation_report(
                 f"- Agreement: {item['agreement_signal']['label']}",
                 f"- Risk flags: {', '.join(item['risk_flags']) or 'none'}",
                 f"- Expected source gaps: {', '.join(item['expected_source_matches']['missing']) or 'none'}",
+                f"- Expected source recall: {item['expected_source_metrics']['recall_at_k'] if item['expected_source_metrics']['recall_at_k'] is not None else 'not evaluated'}",
+                f"- Expected source MRR: {item['expected_source_metrics']['mean_reciprocal_rank'] if item['expected_source_metrics']['mean_reciprocal_rank'] is not None else 'not evaluated'}",
                 f"- Answer preview: {item['answer_preview']}",
                 "",
             ]
@@ -1165,9 +1321,10 @@ def write_evaluation_report(
                 ]
             )
             for variant in item["variant_stability"]["details"]:
+                expected_recall = variant["expected_source_recall"]
                 lines.extend(
                     [
-                        f"- {variant['label']}: source overlap {variant['source_overlap']:.2f}, constellation overlap {variant['constellation_overlap']:.2f}, chunk overlap {variant['chunk_overlap']:.2f}, posture match {'yes' if variant['posture_match'] else 'no'}, agreement match {'yes' if variant['agreement_match'] else 'no'}",
+                        f"- {variant['label']}: source overlap {variant['source_overlap']:.2f}, constellation overlap {variant['constellation_overlap']:.2f}, chunk overlap {variant['chunk_overlap']:.2f}, posture match {'yes' if variant['posture_match'] else 'no'}, agreement match {'yes' if variant['agreement_match'] else 'no'}, expected source recall {f'{expected_recall:.2f}' if expected_recall is not None else 'not evaluated'}",
                     ]
                 )
             lines.append("")
@@ -1259,6 +1416,13 @@ def command_evaluate(args: argparse.Namespace) -> None:
         model=args.model,
         default_source_filter=args.source_filter,
     )
+    evaluation["quality_gate"] = build_quality_gate(
+        summary=evaluation["summary"],
+        min_expected_source_recall=args.min_expected_source_recall,
+        min_expected_source_mrr=args.min_expected_source_mrr,
+        min_variant_stability_rate=args.min_variant_stability_rate,
+        max_flagged_query_rate=args.max_flagged_query_rate,
+    )
 
     summary = evaluation["summary"]
     table = Table(title="Evaluation Summary")
@@ -1266,11 +1430,14 @@ def command_evaluate(args: argparse.Namespace) -> None:
     table.add_column("Value")
     table.add_row("Queries", str(summary["query_count"]))
     table.add_row("Flagged", str(summary["flagged_query_count"]))
+    table.add_row("Expected source recall", f"{summary['expected_source_recall']:.2f}")
+    table.add_row("Expected source MRR", f"{summary['expected_source_mrr']:.2f}")
     table.add_row("Avg sources", str(summary["avg_source_count"]))
     table.add_row("Avg dominant source share", f"{summary['avg_dominant_source_share']:.2f}")
     table.add_row("Avg dominant constellation share", f"{summary['avg_dominant_constellation_share']:.2f}")
     table.add_row("Queries with variants", str(summary["variant_query_count"]))
     table.add_row("Stable variant queries", str(summary["stable_variant_query_count"]))
+    table.add_row("Variant stability rate", f"{summary['variant_stability_rate']:.2f}")
     table.add_row("Avg variant source overlap", f"{summary['avg_variant_source_overlap']:.2f}")
     table.add_row("Avg variant constellation overlap", f"{summary['avg_variant_constellation_overlap']:.2f}")
     console.print(table)
@@ -1295,6 +1462,18 @@ def command_evaluate(args: argparse.Namespace) -> None:
                 f"{', '.join(item['risk_flags'])}"
             )
 
+    quality_gate = evaluation["quality_gate"]
+    if quality_gate["configured"]:
+        gate_label = "PASS" if quality_gate["passed"] else "FAIL"
+        gate_style = "green" if quality_gate["passed"] else "red"
+        console.print(f"\n[{gate_style}][bold]Quality gate: {gate_label}[/bold][/{gate_style}]")
+        for check in quality_gate["checks"]:
+            check_label = "PASS" if check["passed"] else "FAIL"
+            console.print(
+                f"- {check_label}: {check['label']} {check['actual']:.2f} "
+                f"{check['comparator']} {check['threshold']:.2f}"
+            )
+
     if args.json_out:
         output_path = Path(args.json_out).resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1308,6 +1487,16 @@ def command_evaluate(args: argparse.Namespace) -> None:
             output_path=Path(args.report_out).resolve(),
         )
 
+    if quality_gate["configured"] and not quality_gate["passed"]:
+        raise SystemExit(1)
+
+
+def unit_interval(value: str) -> float:
+    parsed = float(value)
+    if not 0.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError("must be between 0 and 1")
+    return parsed
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Context Constellation RAG")
@@ -1316,7 +1505,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_index = sub.add_parser("index", help="Build embedding and lexical index")
     p_index.add_argument("--corpus", required=True, help="Path to folder containing .txt/.md files")
     p_index.add_argument("--index-dir", required=True, help="Output directory for index artifacts")
-    p_index.add_argument("--embedding-model", default="sentence-transformers/all-MiniLM-L6-v2")
+    p_index.add_argument(
+        "--embedding-model",
+        default="sentence-transformers/all-MiniLM-L6-v2",
+        help="Sentence Transformers model name, or 'hashing' for deterministic offline embeddings.",
+    )
     p_index.add_argument("--chunk-size", type=int, default=520)
     p_index.add_argument("--overlap-sentences", type=int, default=1)
     p_index.set_defaults(func=command_index)
@@ -1349,6 +1542,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_eval.add_argument("--source-filter", help="Optional default regex applied to source paths for every query.")
     p_eval.add_argument("--json-out", help="Optional path to save evaluation results as JSON")
     p_eval.add_argument("--report-out", help="Optional path to save a markdown evaluation report")
+    p_eval.add_argument(
+        "--min-expected-source-recall",
+        type=unit_interval,
+        help="Fail when recall across expected source patterns and query variants is below this value.",
+    )
+    p_eval.add_argument(
+        "--min-expected-source-mrr",
+        type=unit_interval,
+        help="Fail when expected source mean reciprocal rank is below this value.",
+    )
+    p_eval.add_argument(
+        "--min-variant-stability-rate",
+        type=unit_interval,
+        help="Fail when the share of stable variant-backed queries is below this value.",
+    )
+    p_eval.add_argument(
+        "--max-flagged-query-rate",
+        type=unit_interval,
+        help="Fail when the share of queries with evidence risk flags exceeds this value.",
+    )
     p_eval.set_defaults(func=command_evaluate)
 
     return parser

@@ -2,7 +2,4 @@
 *.pyc
 .venv/
 venv/
-artifacts/index/
-artifacts/test-*/
-artifacts/test-*.json
-artifacts/test-*.md
+artifacts/

@@ -35,6 +35,12 @@ Build index:
 python main.py index --corpus example_corpus --index-dir artifacts/index
 ```
 
+For a fast, deterministic offline index that never downloads a model:
+
+```bash
+python main.py index --corpus example_corpus --index-dir artifacts/index --embedding-model hashing
+```
+
 Ask a question:
 
 ```bash
@@ -97,6 +103,7 @@ python main.py evaluate --index-dir artifacts/index --queries example_queries.js
 Each evaluation query can be a plain string or an object with `query`, optional `label`, optional `source_filter`, optional `expected_sources`, and optional `variants`.
 Use `expected_sources` to declare regex patterns over source paths that should show up in the evidence trail, and `variants` to provide alternate phrasings that stress-test retrieval stability.
 The evaluation summary now highlights answer-mode mix, coverage posture, agreement mix, expected-source misses, and whether a question stays stable across paraphrases or turns brittle under rewording.
+Expected source patterns are also scored with recall at K and mean reciprocal rank (MRR), including every declared paraphrase variant, so retrieval changes can be compared quantitatively.
 
 Example evaluation entry:
 
@@ -116,9 +123,28 @@ Example evaluation entry:
 
 Evaluation outputs now include:
 
+- expected-source recall and MRR across primary questions and variants
+- the best evidence rank and matching source paths for every expected-source pattern
 - variant stability averages for source, constellation, and chunk overlap
 - per-query `variant-sensitive retrieval` flags when paraphrases pull the evidence trail apart
 - per-query expected-source gaps when important document families disappear from the answer
+
+Use evaluation thresholds as a CI regression gate. The command writes JSON and Markdown outputs before returning a non-zero exit code when any configured threshold fails:
+
+```bash
+python main.py evaluate \
+  --index-dir artifacts/index \
+  --queries example_queries.json \
+  --llm off \
+  --min-expected-source-recall 1.0 \
+  --min-expected-source-mrr 0.30 \
+  --min-variant-stability-rate 0.75 \
+  --max-flagged-query-rate 0.25 \
+  --json-out artifacts/evaluation.json \
+  --report-out artifacts/evaluation.md
+```
+
+All thresholds are optional values from `0` to `1`. The checked-in CI workflow builds a hashing index, runs the unit suite, and enforces the sample corpus gate without network-dependent embeddings.
 
 ## Optional LLM mode
 
@@ -154,6 +180,7 @@ It also surfaces a quick evidence-coverage badge so demo viewers can tell when a
 
 - `main.py`: end-to-end pipeline (ingest, embed, index, retrieve, answer)
 - `example_queries.json`: starter evaluation suite with source expectations and paraphrase variants
+- `tests/test_evaluation.py`: deterministic coverage for rank metrics, gates, and offline embeddings
 - `web_app.py`: tiny local browser UI for query + citation trace
 - `example_corpus/`: sample documents for demo
 - `artifacts/`: generated index output
@@ -161,6 +188,7 @@ It also surfaces a quick evidence-coverage badge so demo viewers can tell when a
 ## Notes
 
 - Works fully offline for retrieval and extractive answers.
+- `--embedding-model hashing` makes offline behavior explicit and reproducible instead of waiting for model loading to fail over.
 - If the sentence-transformer model cannot be downloaded, the app automatically falls back to local hashing-based vector embeddings so the full RAG flow still runs.
 - LLM synthesis is optional and never required to test the core RAG behavior.
 
