@@ -35,7 +35,7 @@ def read_corpus(corpus_dir: Path) -> list[tuple[str, str]]:
     for path in sorted(corpus_dir.rglob("*")):
         if path.is_file() and path.suffix.lower() in {".txt", ".md"}:
             raw = path.read_text(encoding="utf-8", errors="ignore")
-            docs.append((str(path.relative_to(corpus_dir)), raw.replace("\ufeff", "")))
+            docs.append((path.relative_to(corpus_dir).as_posix(), raw.replace("\ufeff", "")))
     return docs
 
 
@@ -87,6 +87,12 @@ def chunk_text(source: str, text: str, target_chars: int = 520, overlap_sentence
         )
 
     return chunks
+
+
+def build_retrieval_text(chunk: Chunk) -> str:
+    source_without_suffix = re.sub(r"\.[^./\\]+$", "", chunk.source)
+    source_terms = re.sub(r"[/\\_.-]+", " ", source_without_suffix).strip()
+    return f"Source: {source_terms}. {chunk.text}"
 
 
 class EmbeddingEngine:
@@ -231,7 +237,34 @@ def normalize_scores(values: np.ndarray) -> np.ndarray:
     return (values - lo) / (hi - lo)
 
 
-def mmr_select(candidate_indices: list[int], query_vec: np.ndarray, doc_embeddings: np.ndarray, top_k: int, lambda_mult: float = 0.7) -> list[int]:
+def build_stale_source_penalties(query: str, chunks: list[Chunk]) -> dict[int, float]:
+    current_intent = re.search(
+        r"\b(current|latest|now|authoritative|authority|go-live)\b",
+        query,
+        flags=re.IGNORECASE,
+    )
+    if not current_intent:
+        return {}
+
+    stale_pattern = re.compile(
+        r"\b(archive|archived|superseded|obsolete|deprecated|outdated)\b",
+        flags=re.IGNORECASE,
+    )
+    return {
+        index: 0.45
+        for index, chunk in enumerate(chunks)
+        if stale_pattern.search(f"{chunk.source} {chunk.text[:400]}")
+    }
+
+
+def mmr_select(
+    candidate_indices: list[int],
+    query_vec: np.ndarray,
+    doc_embeddings: np.ndarray,
+    top_k: int,
+    lambda_mult: float = 0.7,
+    relevance_scores: dict[int, float] | None = None,
+) -> list[int]:
     chosen: list[int] = []
     remaining = candidate_indices.copy()
 
@@ -239,7 +272,11 @@ def mmr_select(candidate_indices: list[int], query_vec: np.ndarray, doc_embeddin
         best_idx = remaining[0]
         best_score = -1e9
         for idx in remaining:
-            rel = float(np.dot(query_vec, doc_embeddings[idx]))
+            rel = (
+                relevance_scores[idx]
+                if relevance_scores is not None
+                else float(np.dot(query_vec, doc_embeddings[idx]))
+            )
             div = 0.0
             if chosen:
                 div = max(float(np.dot(doc_embeddings[idx], doc_embeddings[c])) for c in chosen)
@@ -540,6 +577,85 @@ def build_expected_source_metrics(
     }
 
 
+def build_forbidden_source_metrics(
+    *,
+    forbidden_sources: list[str],
+    evidence: list[dict[str, Any]],
+    rank_cutoff: int = 3,
+) -> dict[str, Any]:
+    details = []
+    for pattern_text in forbidden_sources:
+        try:
+            pattern = re.compile(pattern_text)
+        except re.error as exc:
+            raise SystemExit(f"Invalid forbidden source regex {pattern_text!r}: {exc}") from exc
+
+        matching_rows = [row for row in evidence if pattern.search(row["chunk"].source)]
+        best_rank = min((int(row["rank"]) for row in matching_rows), default=None)
+        details.append(
+            {
+                "pattern": pattern_text,
+                "matched_sources": sorted({row["chunk"].source for row in matching_rows}),
+                "best_rank": best_rank,
+                "violates_cutoff": best_rank is not None and best_rank <= rank_cutoff,
+            }
+        )
+
+    hit_count = sum(1 for item in details if item["violates_cutoff"])
+    return {
+        "forbidden_count": len(details),
+        "hit_count": hit_count,
+        "hit_rate": round(hit_count / len(details), 4) if details else None,
+        "rank_cutoff": rank_cutoff,
+        "details": details,
+    }
+
+
+def build_conflict_source_metrics(
+    *,
+    conflict_source_groups: list[list[str]],
+    evidence: list[dict[str, Any]],
+) -> dict[str, Any]:
+    details = []
+    for group_index, source_patterns in enumerate(conflict_source_groups, start=1):
+        if len(source_patterns) < 2:
+            raise SystemExit(
+                f"Conflict source group {group_index} must declare at least two source patterns."
+            )
+        source_metrics = build_expected_source_metrics(
+            expected_sources=source_patterns,
+            evidence=evidence,
+        )
+        distinct_sources = sorted(
+            {
+                source
+                for item in source_metrics["details"]
+                for source in item["matched_sources"]
+            }
+        )
+        covered = (
+            source_metrics["matched_count"] == source_metrics["expected_count"]
+            and len(distinct_sources) >= len(source_patterns)
+        )
+        details.append(
+            {
+                "group_index": group_index,
+                "source_patterns": source_patterns,
+                "covered": covered,
+                "distinct_sources": distinct_sources,
+                "source_metrics": source_metrics,
+            }
+        )
+
+    covered_count = sum(1 for item in details if item["covered"])
+    return {
+        "group_count": len(details),
+        "covered_count": covered_count,
+        "recall": round(covered_count / len(details), 4) if details else None,
+        "details": details,
+    }
+
+
 def build_quality_gate(
     *,
     summary: dict[str, Any],
@@ -547,12 +663,26 @@ def build_quality_gate(
     min_expected_source_mrr: float | None = None,
     min_variant_stability_rate: float | None = None,
     max_flagged_query_rate: float | None = None,
+    max_forbidden_source_hit_rate: float | None = None,
+    min_conflict_source_recall: float | None = None,
 ) -> dict[str, Any]:
     configured = [
         ("expected source recall", "expected_source_recall", min_expected_source_recall, ">="),
         ("expected source MRR", "expected_source_mrr", min_expected_source_mrr, ">="),
         ("variant stability rate", "variant_stability_rate", min_variant_stability_rate, ">="),
         ("flagged query rate", "flagged_query_rate", max_flagged_query_rate, "<="),
+        (
+            "forbidden source hit rate in top 3",
+            "forbidden_source_hit_rate",
+            max_forbidden_source_hit_rate,
+            "<=",
+        ),
+        (
+            "conflict source recall",
+            "conflict_source_recall",
+            min_conflict_source_recall,
+            ">=",
+        ),
     ]
     checks = []
     for label, metric, threshold, comparator in configured:
@@ -629,8 +759,20 @@ def run_query_payload(
     lex_norm = normalize_scores(lex_subset)
 
     hybrid = 0.7 * dense_norm + 0.3 * lex_norm
-    ordering = np.argsort(hybrid)[::-1]
+    stale_penalties = build_stale_source_penalties(query, chunks)
+    adjusted_hybrid = np.asarray(
+        [
+            float(hybrid[position]) - stale_penalties.get(int(dense_indices[position]), 0.0)
+            for position in range(len(dense_indices))
+        ],
+        dtype=np.float32,
+    )
+    ordering = np.argsort(adjusted_hybrid)[::-1]
     candidates = [int(dense_indices[i]) for i in ordering]
+    hybrid_by_index = {
+        int(dense_indices[position]): float(adjusted_hybrid[position])
+        for position in range(len(dense_indices))
+    }
 
     selected = mmr_select(
         candidates,
@@ -638,6 +780,7 @@ def run_query_payload(
         doc_embeddings=embeddings,
         top_k=top_k,
         lambda_mult=mmr_lambda,
+        relevance_scores=hybrid_by_index,
     )
 
     selected_rows: list[dict[str, Any]] = []
@@ -652,6 +795,7 @@ def run_query_payload(
                 "constellation": f"K{label} ({theme})",
                 "dense": float(np.dot(query_vec, embeddings[idx])),
                 "lex": float(lex_scores_all[idx]),
+                "stale_source_penalty": stale_penalties.get(idx, 0.0),
             }
         )
 
@@ -732,16 +876,17 @@ def command_index(args: argparse.Namespace) -> None:
         raise SystemExit("Need at least 3 chunks to build a useful index.")
 
     texts = [chunk.text for chunk in chunks]
+    retrieval_texts = [build_retrieval_text(chunk) for chunk in chunks]
 
     console.print(f"[bold]Embedding[/bold] {len(texts)} chunks with model: {args.embedding_model}")
     embedder = EmbeddingEngine(model_name=args.embedding_model)
-    embeddings = embedder.encode(texts)
+    embeddings = embedder.encode(retrieval_texts)
 
     dense = faiss.IndexFlatIP(embeddings.shape[1])
     dense.add(embeddings)
 
     vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_features=7000)
-    lexical_matrix = vectorizer.fit_transform(texts)
+    lexical_matrix = vectorizer.fit_transform(retrieval_texts)
 
     cluster_count = max(2, min(8, len(chunks) // 4))
     kmeans = KMeans(n_clusters=cluster_count, random_state=42, n_init="auto")
@@ -995,6 +1140,20 @@ def load_query_suite(path: Path) -> list[dict[str, Any]]:
                     for source in item.get("expected_sources", [])
                     if str(source).strip()
                 ],
+                "forbidden_sources": [
+                    str(source).strip()
+                    for source in item.get("forbidden_sources", [])
+                    if str(source).strip()
+                ],
+                "conflict_source_groups": [
+                    [
+                        str(source).strip()
+                        for source in group
+                        if str(source).strip()
+                    ]
+                    for group in item.get("conflict_source_groups", [])
+                    if isinstance(group, list)
+                ],
                 "variants": [
                     {
                         "query": str(variant["query"]).strip(),
@@ -1026,6 +1185,8 @@ def evaluate_query_suite(
     mode_counts: dict[str, int] = {}
     flagged_queries = []
     expected_metric_runs: list[dict[str, Any]] = []
+    forbidden_metric_runs: list[dict[str, Any]] = []
+    conflict_metric_runs: list[dict[str, Any]] = []
 
     for idx, entry in enumerate(queries, start=1):
         source_filter = entry.get("source_filter") or default_source_filter
@@ -1073,6 +1234,29 @@ def evaluate_query_suite(
         if expected_source_matches["missing"]:
             risk_flags.append("missed expected sources")
 
+        forbidden_sources = entry.get("forbidden_sources") or []
+        forbidden_source_metrics = build_forbidden_source_metrics(
+            forbidden_sources=forbidden_sources,
+            evidence=result["evidence"],
+        )
+        if forbidden_sources:
+            forbidden_metric_runs.append(forbidden_source_metrics)
+        if forbidden_source_metrics["hit_count"]:
+            risk_flags.append("retrieved forbidden sources")
+
+        conflict_source_groups = entry.get("conflict_source_groups") or []
+        conflict_source_metrics = build_conflict_source_metrics(
+            conflict_source_groups=conflict_source_groups,
+            evidence=result["evidence"],
+        )
+        if conflict_source_groups:
+            conflict_metric_runs.append(conflict_source_metrics)
+        if (
+            conflict_source_metrics["group_count"]
+            and conflict_source_metrics["covered_count"] < conflict_source_metrics["group_count"]
+        ):
+            risk_flags.append("missed conflict evidence")
+
         variant_results = []
         for variant_idx, variant in enumerate(entry.get("variants") or [], start=1):
             variant_source_filter = variant.get("source_filter") or source_filter
@@ -1092,6 +1276,18 @@ def evaluate_query_suite(
             )
             if expected_sources:
                 expected_metric_runs.append(variant_expected_source_metrics)
+            variant_forbidden_source_metrics = build_forbidden_source_metrics(
+                forbidden_sources=forbidden_sources,
+                evidence=variant_result["evidence"],
+            )
+            if forbidden_sources:
+                forbidden_metric_runs.append(variant_forbidden_source_metrics)
+            variant_conflict_source_metrics = build_conflict_source_metrics(
+                conflict_source_groups=conflict_source_groups,
+                evidence=variant_result["evidence"],
+            )
+            if conflict_source_groups:
+                conflict_metric_runs.append(variant_conflict_source_metrics)
             variant_results.append(
                 {
                     "variant_index": variant_idx,
@@ -1100,6 +1296,8 @@ def evaluate_query_suite(
                     "source_filter": variant_source_filter,
                     "result": variant_result,
                     "expected_source_metrics": variant_expected_source_metrics,
+                    "forbidden_source_metrics": variant_forbidden_source_metrics,
+                    "conflict_source_metrics": variant_conflict_source_metrics,
                 }
             )
 
@@ -1108,6 +1306,18 @@ def evaluate_query_suite(
             risk_flags.append("variant-sensitive retrieval")
         if any(item["missing_expected_sources"] for item in variant_stability["details"]):
             risk_flags.append("variant missed expected sources")
+        if any(
+            variant["forbidden_source_metrics"]["hit_count"]
+            for variant in variant_results
+        ):
+            risk_flags.append("variant retrieved forbidden sources")
+        if any(
+            metrics["group_count"] and metrics["covered_count"] < metrics["group_count"]
+            for metrics in (
+                variant["conflict_source_metrics"] for variant in variant_results
+            )
+        ):
+            risk_flags.append("variant missed conflict evidence")
 
         evaluated = {
             "query_index": idx,
@@ -1118,6 +1328,10 @@ def evaluate_query_suite(
             "expected_sources": expected_sources,
             "expected_source_matches": expected_source_matches,
             "expected_source_metrics": expected_source_metrics,
+            "forbidden_sources": forbidden_sources,
+            "forbidden_source_metrics": forbidden_source_metrics,
+            "conflict_source_groups": conflict_source_groups,
+            "conflict_source_metrics": conflict_source_metrics,
             "source_count": result["source_count"],
             "evidence_posture": result["evidence_posture"],
             "agreement_signal": result["agreement_signal"],
@@ -1138,6 +1352,10 @@ def evaluate_query_suite(
         for run in expected_metric_runs
         for detail in run["details"]
     ]
+    forbidden_pattern_count = sum(item["forbidden_count"] for item in forbidden_metric_runs)
+    forbidden_pattern_hit_count = sum(item["hit_count"] for item in forbidden_metric_runs)
+    conflict_group_count = sum(item["group_count"] for item in conflict_metric_runs)
+    covered_conflict_group_count = sum(item["covered_count"] for item in conflict_metric_runs)
     variant_query_count = sum(1 for item in results if item["variant_stability"]["variant_count"])
     stable_variant_query_count = sum(
         1
@@ -1172,6 +1390,23 @@ def evaluate_query_suite(
             else 0.0
         ),
         "expected_source_mrr": round(mean(expected_reciprocal_ranks), 4) if expected_reciprocal_ranks else 0.0,
+        "forbidden_source_case_count": len(forbidden_metric_runs),
+        "forbidden_source_pattern_count": forbidden_pattern_count,
+        "forbidden_source_pattern_hit_count": forbidden_pattern_hit_count,
+        "forbidden_source_rank_cutoff": 3,
+        "forbidden_source_hit_rate": (
+            round(forbidden_pattern_hit_count / forbidden_pattern_count, 4)
+            if forbidden_pattern_count
+            else 0.0
+        ),
+        "conflict_source_case_count": len(conflict_metric_runs),
+        "conflict_source_group_count": conflict_group_count,
+        "covered_conflict_source_group_count": covered_conflict_group_count,
+        "conflict_source_recall": (
+            round(covered_conflict_group_count / conflict_group_count, 4)
+            if conflict_group_count
+            else 0.0
+        ),
         "variant_query_count": variant_query_count,
         "stable_variant_query_count": stable_variant_query_count,
         "variant_stability_rate": (
@@ -1214,6 +1449,16 @@ def write_evaluation_report(
     output_path: Path,
 ) -> None:
     summary = evaluation["summary"]
+    forbidden_rate = (
+        f"{summary['forbidden_source_hit_rate']:.2f}"
+        if summary["forbidden_source_pattern_count"]
+        else "not evaluated"
+    )
+    conflict_recall = (
+        f"{summary['conflict_source_recall']:.2f}"
+        if summary["conflict_source_group_count"]
+        else "not evaluated"
+    )
     lines = [
         "# Context Constellation Evaluation Report",
         "",
@@ -1223,6 +1468,8 @@ def write_evaluation_report(
         f"- Flagged queries: {summary['flagged_query_count']}",
         f"- Expected source recall: {summary['expected_source_recall']:.2f}",
         f"- Expected source MRR: {summary['expected_source_mrr']:.2f}",
+        f"- Forbidden source hit rate (top {summary['forbidden_source_rank_cutoff']}): {forbidden_rate}",
+        f"- Conflict source recall: {conflict_recall}",
         f"- Average source count: {summary['avg_source_count']}",
         f"- Average dominant source share: {summary['avg_dominant_source_share']:.2f}",
         f"- Average dominant constellation share: {summary['avg_dominant_constellation_share']:.2f}",
@@ -1275,6 +1522,8 @@ def write_evaluation_report(
                     f"- Sources: {', '.join(f'{source} ({count})' for source, count in item['source_breakdown'].items())}",
                     f"- Expected source gaps: {', '.join(item['expected_source_matches']['missing']) or 'none'}",
                     f"- Expected source recall: {item['expected_source_metrics']['recall_at_k'] if item['expected_source_metrics']['recall_at_k'] is not None else 'not evaluated'}",
+                    f"- Forbidden source hits: {item['forbidden_source_metrics']['hit_count']}",
+                    f"- Conflict groups covered: {item['conflict_source_metrics']['covered_count']} / {item['conflict_source_metrics']['group_count']}",
                     (
                         "- Variant stability: "
                         f"{'stable' if item['variant_stability']['stable'] else 'unstable'} "
@@ -1296,6 +1545,7 @@ def write_evaluation_report(
                 f"- Answer mode: {item['answer_mode']}",
                 f"- Source filter: {item['source_filter'] or 'none'}",
                 f"- Expected sources: {', '.join(item['expected_sources']) or 'none'}",
+                f"- Forbidden sources: {', '.join(item['forbidden_sources']) or 'none'}",
                 f"- Sources: {item['source_count']}",
                 f"- Posture: {item['evidence_posture']['coverage_label']} / {item['evidence_posture']['tension_label']}",
                 f"- Agreement: {item['agreement_signal']['label']}",
@@ -1303,6 +1553,8 @@ def write_evaluation_report(
                 f"- Expected source gaps: {', '.join(item['expected_source_matches']['missing']) or 'none'}",
                 f"- Expected source recall: {item['expected_source_metrics']['recall_at_k'] if item['expected_source_metrics']['recall_at_k'] is not None else 'not evaluated'}",
                 f"- Expected source MRR: {item['expected_source_metrics']['mean_reciprocal_rank'] if item['expected_source_metrics']['mean_reciprocal_rank'] is not None else 'not evaluated'}",
+                f"- Forbidden source hits: {item['forbidden_source_metrics']['hit_count']}",
+                f"- Conflict groups covered: {item['conflict_source_metrics']['covered_count']} / {item['conflict_source_metrics']['group_count']}",
                 f"- Answer preview: {item['answer_preview']}",
                 "",
             ]
@@ -1365,6 +1617,7 @@ def command_ask(args: argparse.Namespace) -> None:
                     "constellation": row["constellation"],
                     "dense": row["dense"],
                     "lex": row["lex"],
+                    "stale_source_penalty": row["stale_source_penalty"],
                     "chunk": asdict(row["chunk"]),
                 }
                 for row in result["evidence"]
@@ -1422,9 +1675,21 @@ def command_evaluate(args: argparse.Namespace) -> None:
         min_expected_source_mrr=args.min_expected_source_mrr,
         min_variant_stability_rate=args.min_variant_stability_rate,
         max_flagged_query_rate=args.max_flagged_query_rate,
+        max_forbidden_source_hit_rate=args.max_forbidden_source_hit_rate,
+        min_conflict_source_recall=args.min_conflict_source_recall,
     )
 
     summary = evaluation["summary"]
+    forbidden_rate = (
+        f"{summary['forbidden_source_hit_rate']:.2f}"
+        if summary["forbidden_source_pattern_count"]
+        else "not evaluated"
+    )
+    conflict_recall = (
+        f"{summary['conflict_source_recall']:.2f}"
+        if summary["conflict_source_group_count"]
+        else "not evaluated"
+    )
     table = Table(title="Evaluation Summary")
     table.add_column("Metric")
     table.add_column("Value")
@@ -1432,6 +1697,11 @@ def command_evaluate(args: argparse.Namespace) -> None:
     table.add_row("Flagged", str(summary["flagged_query_count"]))
     table.add_row("Expected source recall", f"{summary['expected_source_recall']:.2f}")
     table.add_row("Expected source MRR", f"{summary['expected_source_mrr']:.2f}")
+    table.add_row(
+        f"Forbidden source hit rate (top {summary['forbidden_source_rank_cutoff']})",
+        forbidden_rate,
+    )
+    table.add_row("Conflict source recall", conflict_recall)
     table.add_row("Avg sources", str(summary["avg_source_count"]))
     table.add_row("Avg dominant source share", f"{summary['avg_dominant_source_share']:.2f}")
     table.add_row("Avg dominant constellation share", f"{summary['avg_dominant_constellation_share']:.2f}")
@@ -1561,6 +1831,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-flagged-query-rate",
         type=unit_interval,
         help="Fail when the share of queries with evidence risk flags exceeds this value.",
+    )
+    p_eval.add_argument(
+        "--max-forbidden-source-hit-rate",
+        type=unit_interval,
+        help="Fail when explicitly declared distractor patterns appear in the first three evidence ranks above this rate.",
+    )
+    p_eval.add_argument(
+        "--min-conflict-source-recall",
+        type=unit_interval,
+        help="Fail when retrieval covers fewer than this share of declared conflict source groups.",
     )
     p_eval.set_defaults(func=command_evaluate)
 

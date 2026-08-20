@@ -1,0 +1,98 @@
+[
+  {
+    "label": "pause-despite-healthy-load",
+    "query": "Why is the European checkout rollout paused even though load and latency checks passed?",
+    "expected_sources": [
+      "operations/checkout_launch_decision",
+      "engineering/checkout_load_test",
+      "support/eu_checkout_escalations"
+    ],
+    "forbidden_sources": [
+      "archive/checkout_launch_draft",
+      "search/search_latency_review",
+      "identity/passwordless_pilot"
+    ],
+    "conflict_source_groups": [
+      ["engineering/checkout_load_test", "support/eu_checkout_escalations"]
+    ],
+    "variants": [
+      {
+        "label": "capacity-versus-correctness",
+        "query": "If checkout capacity is healthy, what evidence is blocking the EU launch?"
+      }
+    ]
+  },
+  {
+    "label": "invoice-defect-corroboration",
+    "query": "Which independent evidence confirms that duplicate VAT was a real charged invoice defect?",
+    "expected_sources": [
+      "support/eu_checkout_escalations",
+      "finance/eu_invoice_reconciliation",
+      "compliance/vat_policy_review"
+    ],
+    "forbidden_sources": [
+      "mobile/ios_release_readiness",
+      "identity/passwordless_pilot"
+    ],
+    "variants": [
+      {
+        "label": "customer-ledger-corroboration",
+        "query": "Do customer reports and ledger records agree about the EU tax overcharge?"
+      }
+    ]
+  },
+  {
+    "label": "current-launch-authority",
+    "query": "What is the current go-live decision for European checkout?",
+    "expected_sources": ["operations/checkout_launch_decision"],
+    "forbidden_sources": ["archive/checkout_launch_draft"],
+    "variants": [
+      {
+        "label": "latest-authority",
+        "query": "Which document controls whether European checkout can launch now?"
+      }
+    ]
+  },
+  {
+    "label": "latency-root-cause-check",
+    "query": "Was service latency the root cause of the European checkout pause?",
+    "expected_sources": [
+      "operations/checkout_launch_decision",
+      "engineering/checkout_load_test"
+    ],
+    "forbidden_sources": [
+      "search/search_latency_review",
+      "mobile/ios_release_readiness"
+    ],
+    "conflict_source_groups": [
+      ["operations/checkout_launch_decision", "engineering/checkout_load_test"]
+    ],
+    "variants": [
+      {
+        "label": "performance-hypothesis",
+        "query": "Do the performance results explain why EU checkout expansion stopped?"
+      }
+    ]
+  },
+  {
+    "label": "resume-criteria",
+    "query": "What evidence and approvals are still required before European checkout can resume?",
+    "expected_sources": [
+      "operations/checkout_launch_decision",
+      "finance/eu_invoice_reconciliation",
+      "compliance/vat_policy_review",
+      "support/eu_checkout_escalations"
+    ],
+    "forbidden_sources": [
+      "archive/checkout_launch_draft",
+      "search/search_latency_review",
+      "identity/passwordless_pilot"
+    ],
+    "variants": [
+      {
+        "label": "restart-gate",
+        "query": "Which teams must sign off and what proof do they need to restart the EU cohort?"
+      }
+    ]
+  }
+]

@@ -1,6 +1,6 @@
 # Context Constellation RAG
 
-A creative, portfolio-grade Retrieval-Augmented Generation project that turns a corpus into a **constellation map** of ideas.
+A local Retrieval-Augmented Generation tool that turns a document corpus into a queryable evidence map.
 
 It combines:
 
@@ -10,7 +10,7 @@ It combines:
 - Hybrid ranking + MMR diversification
 - Optional LLM synthesis with grounded citations
 
-## Why this is unique
+## Why it exists
 
 Instead of only returning nearest chunks, this project groups retrieved evidence into themed **constellations** and answers with an explicit evidence trail. The output reads like an analyst memo, not a black box response.
 
@@ -20,6 +20,8 @@ Instead of only returning nearest chunks, this project groups retrieved evidence
 - `ask`: Query with hybrid retrieval and citation-grounded answer
 - `map`: Inspect the discovered constellation clusters and dominant themes
 - `evaluate`: Run a repeatable query suite, check paraphrase stability, and flag weak evidence patterns before demoing or iterating
+
+Source paths are normalized across operating systems and included as searchable metadata. Hybrid dense/lexical relevance feeds the MMR selection step, rather than only narrowing its candidate pool. Queries asking for the current or latest authority also demote evidence explicitly marked archived, superseded, obsolete, deprecated, or outdated.
 
 ## Quick start
 
@@ -100,8 +102,9 @@ Export the evaluation as JSON + Markdown for a portfolio-ready validation artifa
 python main.py evaluate --index-dir artifacts/index --queries example_queries.json --llm off --json-out artifacts/test-eval.json --report-out artifacts/test-eval.md
 ```
 
-Each evaluation query can be a plain string or an object with `query`, optional `label`, optional `source_filter`, optional `expected_sources`, and optional `variants`.
+Each evaluation query can be a plain string or an object with `query`, optional `label`, optional `source_filter`, optional `expected_sources`, optional `forbidden_sources`, optional `conflict_source_groups`, and optional `variants`.
 Use `expected_sources` to declare regex patterns over source paths that should show up in the evidence trail, and `variants` to provide alternate phrasings that stress-test retrieval stability.
+Use `forbidden_sources` for known distractor patterns that must stay out of the first three evidence ranks. Use `conflict_source_groups` to require all sides of a documented disagreement to appear together; each group is an array of at least two source regexes.
 The evaluation summary now highlights answer-mode mix, coverage posture, agreement mix, expected-source misses, and whether a question stays stable across paraphrases or turns brittle under rewording.
 Expected source patterns are also scored with recall at K and mean reciprocal rank (MRR), including every declared paraphrase variant, so retrieval changes can be compared quantitatively.
 
@@ -128,6 +131,8 @@ Evaluation outputs now include:
 - variant stability averages for source, constellation, and chunk overlap
 - per-query `variant-sensitive retrieval` flags when paraphrases pull the evidence trail apart
 - per-query expected-source gaps when important document families disappear from the answer
+- top-three distractor hit rate for explicitly forbidden source families
+- conflict-source recall for questions that require opposing evidence
 
 Use evaluation thresholds as a CI regression gate. The command writes JSON and Markdown outputs before returning a non-zero exit code when any configured threshold fails:
 
@@ -143,6 +148,28 @@ python main.py evaluate \
   --json-out artifacts/evaluation.json \
   --report-out artifacts/evaluation.md
 ```
+
+### Operational benchmark
+
+The three-document example corpus is useful for a quick demo, but it is too small to establish retrieval quality. `benchmark_corpus/` contains a nine-document checkout incident fixture with a current decision, corroborating operational evidence, a superseded launch draft, and unrelated documents that deliberately reuse launch and latency vocabulary.
+
+Run the same deterministic gate used in CI:
+
+```bash
+python main.py index --corpus benchmark_corpus --index-dir artifacts/benchmark-index --embedding-model hashing
+python main.py evaluate \
+  --index-dir artifacts/benchmark-index \
+  --queries benchmark_queries.json \
+  --llm off \
+  --top-k 6 \
+  --min-expected-source-recall 0.88 \
+  --min-expected-source-mrr 0.50 \
+  --max-forbidden-source-hit-rate 0.25 \
+  --min-conflict-source-recall 0.75 \
+  --min-variant-stability-rate 0.40
+```
+
+This gate tests source recall, rank quality, near-match distractors, cross-source conflicts, and paraphrase stability without downloading an embedding model or calling an LLM.
 
 All thresholds are optional values from `0` to `1`. The checked-in CI workflow builds a hashing index, runs the unit suite, and enforces the sample corpus gate without network-dependent embeddings.
 
@@ -180,6 +207,7 @@ It also surfaces a quick evidence-coverage badge so demo viewers can tell when a
 
 - `main.py`: end-to-end pipeline (ingest, embed, index, retrieve, answer)
 - `example_queries.json`: starter evaluation suite with source expectations and paraphrase variants
+- `benchmark_corpus/` and `benchmark_queries.json`: heterogeneous offline retrieval regression fixture
 - `tests/test_evaluation.py`: deterministic coverage for rank metrics, gates, and offline embeddings
 - `web_app.py`: tiny local browser UI for query + citation trace
 - `example_corpus/`: sample documents for demo

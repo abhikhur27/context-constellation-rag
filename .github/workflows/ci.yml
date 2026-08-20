@@ -28,3 +28,18 @@ jobs:
           --max-flagged-query-rate 0.25
           --json-out artifacts/ci-evaluation.json
           --report-out artifacts/ci-evaluation.md
+      - run: python main.py index --corpus benchmark_corpus --index-dir artifacts/ci-operational-index --embedding-model hashing
+      - name: Enforce operational retrieval benchmark
+        run: >-
+          python main.py evaluate
+          --index-dir artifacts/ci-operational-index
+          --queries benchmark_queries.json
+          --llm off
+          --top-k 6
+          --min-expected-source-recall 0.88
+          --min-expected-source-mrr 0.50
+          --max-forbidden-source-hit-rate 0.25
+          --min-conflict-source-recall 0.75
+          --min-variant-stability-rate 0.40
+          --json-out artifacts/ci-operational-evaluation.json
+          --report-out artifacts/ci-operational-evaluation.md
