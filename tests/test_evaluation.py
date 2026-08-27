@@ -13,6 +13,8 @@ from main import (
     build_forbidden_source_metrics,
     build_quality_gate,
     build_retrieval_text,
+    build_scope_mismatch_penalties,
+    build_source_scope_text,
     build_stale_source_penalties,
     mmr_select,
     read_corpus,
@@ -94,9 +96,47 @@ class RetrievalContractTests(unittest.TestCase):
 
         self.assertEqual(
             build_stale_source_penalties("What is the current launch decision?", chunks),
-            {1: 0.45},
+            {1: 1.25},
         )
         self.assertEqual(build_stale_source_penalties("Compare both launch decisions", chunks), {})
+        self.assertEqual(build_stale_source_penalties("Why did the launch fail?", chunks), {1: 0.30})
+
+    def test_source_scope_uses_path_and_heading_without_body_noise(self) -> None:
+        chunk = Chunk(
+            "search::c1",
+            "search/search_latency_review.md",
+            "# Search Latency Review — 2026-06-18 This body mentions checkout invoices.",
+            0,
+            78,
+        )
+
+        self.assertEqual(
+            build_source_scope_text(chunk),
+            "search search latency review. Search Latency Review",
+        )
+
+    def test_scope_disclaimer_is_demoted_unless_query_names_its_subject(self) -> None:
+        chunks = [
+            Chunk(
+                "search::c1",
+                "search/search_latency_review.md",
+                "This review concerns search ranking only. It contains no checkout evidence.",
+                0,
+                72,
+            )
+        ]
+
+        self.assertEqual(
+            build_scope_mismatch_penalties(
+                "Why is checkout rollout paused even though latency checks passed?",
+                chunks,
+            ),
+            {0: 0.75},
+        )
+        self.assertEqual(
+            build_scope_mismatch_penalties("What does the search latency review conclude?", chunks),
+            {},
+        )
 
     def test_forbidden_source_metrics_capture_distractor_rank(self) -> None:
         metrics = build_forbidden_source_metrics(
@@ -139,6 +179,22 @@ class RetrievalContractTests(unittest.TestCase):
         )
 
         self.assertEqual(selected, [1])
+
+    def test_mmr_prefers_distinct_sources_before_repeating_chunks(self) -> None:
+        embeddings = np.asarray(
+            [[1.0, 0.0], [0.99, 0.01], [0.8, 0.2]],
+            dtype=np.float32,
+        )
+        selected = mmr_select(
+            [0, 1, 2],
+            query_vec=np.asarray([1.0, 0.0], dtype=np.float32),
+            doc_embeddings=embeddings,
+            top_k=2,
+            relevance_scores={0: 1.0, 1: 0.99, 2: 0.8},
+            source_ids={0: "decision.md", 1: "decision.md", 2: "support.md"},
+        )
+
+        self.assertEqual(selected, [0, 2])
 
 
 class QualityGateTests(unittest.TestCase):

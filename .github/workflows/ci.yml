@@ -36,10 +36,11 @@ jobs:
           --queries benchmark_queries.json
           --llm off
           --top-k 6
-          --min-expected-source-recall 0.88
-          --min-expected-source-mrr 0.50
-          --max-forbidden-source-hit-rate 0.25
-          --min-conflict-source-recall 0.75
-          --min-variant-stability-rate 0.40
+          --min-expected-source-recall 1.0
+          --min-expected-source-mrr 0.55
+          --max-forbidden-source-hit-rate 0.0
+          --min-conflict-source-recall 1.0
+          --min-variant-stability-rate 1.0
+          --max-flagged-query-rate 0.0
           --json-out artifacts/ci-operational-evaluation.json
           --report-out artifacts/ci-operational-evaluation.md

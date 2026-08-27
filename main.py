@@ -164,7 +164,19 @@ def compute_cluster_keywords(texts: list[str], labels: np.ndarray, max_terms: in
     return keywords
 
 
-def save_index(index_dir: Path, *, chunks: list[Chunk], embeddings: np.ndarray, faiss_index: faiss.IndexFlatIP, vectorizer: TfidfVectorizer, tfidf_matrix: Any, cluster_labels: np.ndarray, cluster_keywords: dict[int, list[str]], model_name: str) -> None:
+def save_index(
+    index_dir: Path,
+    *,
+    chunks: list[Chunk],
+    embeddings: np.ndarray,
+    faiss_index: faiss.IndexFlatIP,
+    vectorizer: TfidfVectorizer,
+    tfidf_matrix: Any,
+    source_scope_matrix: Any,
+    cluster_labels: np.ndarray,
+    cluster_keywords: dict[int, list[str]],
+    model_name: str,
+) -> None:
     index_dir.mkdir(parents=True, exist_ok=True)
 
     (index_dir / "chunks.json").write_text(
@@ -174,7 +186,14 @@ def save_index(index_dir: Path, *, chunks: list[Chunk], embeddings: np.ndarray, 
     faiss.write_index(faiss_index, str(index_dir / "dense.faiss"))
 
     with (index_dir / "lexical.pkl").open("wb") as handle:
-        pickle.dump({"vectorizer": vectorizer, "matrix": tfidf_matrix}, handle)
+        pickle.dump(
+            {
+                "vectorizer": vectorizer,
+                "matrix": tfidf_matrix,
+                "source_scope_matrix": source_scope_matrix,
+            },
+            handle,
+        )
 
     (index_dir / "clusters.json").write_text(
         json.dumps(
@@ -208,6 +227,11 @@ def load_index(index_dir: Path) -> dict[str, Any]:
 
     with (index_dir / "lexical.pkl").open("rb") as handle:
         lexical = pickle.load(handle)
+    source_scope_matrix = lexical.get("source_scope_matrix")
+    if source_scope_matrix is None:
+        source_scope_matrix = lexical["vectorizer"].transform(
+            [build_source_scope_text(chunk) for chunk in chunks]
+        )
 
     clusters = json.loads((index_dir / "clusters.json").read_text(encoding="utf-8"))
     labels = np.asarray(clusters["labels"], dtype=np.int32)
@@ -221,6 +245,7 @@ def load_index(index_dir: Path) -> dict[str, Any]:
         "dense": dense,
         "vectorizer": lexical["vectorizer"],
         "lexical_matrix": lexical["matrix"],
+        "source_scope_matrix": source_scope_matrix,
         "cluster_labels": labels,
         "cluster_keywords": keywords,
         "meta": meta,
@@ -237,21 +262,127 @@ def normalize_scores(values: np.ndarray) -> np.ndarray:
     return (values - lo) / (hi - lo)
 
 
+SCOPE_STOP_WORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "before",
+    "by",
+    "did",
+    "do",
+    "does",
+    "for",
+    "from",
+    "has",
+    "have",
+    "how",
+    "if",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "their",
+    "this",
+    "to",
+    "was",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "with",
+}
+
+SCOPE_GENERIC_TERMS = {
+    "check",
+    "checks",
+    "current",
+    "decision",
+    "launch",
+    "latest",
+    "report",
+    "results",
+    "review",
+    "rollout",
+    "status",
+    "test",
+}
+
+
+def scope_tokens(value: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", value.lower())
+        if len(token) > 1 and token not in SCOPE_STOP_WORDS
+    }
+
+
+def build_source_scope_text(chunk: Chunk) -> str:
+    source_without_suffix = re.sub(r"\.[^./\\]+$", "", chunk.source)
+    source_terms = re.sub(r"[/\\_.-]+", " ", source_without_suffix).strip()
+    heading = ""
+    if chunk.text.startswith("#"):
+        heading = chunk.text.lstrip("# ").split("—", 1)[0].strip()
+    return f"{source_terms}. {heading}".strip()
+
+
+def build_scope_mismatch_penalties(query: str, chunks: list[Chunk]) -> dict[int, float]:
+    """Demote documents that explicitly disclaim the query's subject.
+
+    Negative scope notes are useful when the question names that document's own
+    subject, so require at least two query terms to align with its source/title
+    before treating the disclaimer as relevant evidence.
+    """
+    query_terms = scope_tokens(query)
+    disclaimer_pattern = re.compile(
+        r"\b(no relationship to|concerns .{0,80}? only|not approval for|"
+        r"unrelated to|outside (?:the )?scope|does not (?:cover|address|apply))\b",
+        flags=re.IGNORECASE,
+    )
+    penalties: dict[int, float] = {}
+    for index, chunk in enumerate(chunks):
+        if not disclaimer_pattern.search(chunk.text[:700]):
+            continue
+        scope_overlap = (
+            query_terms & scope_tokens(build_source_scope_text(chunk))
+        ) - SCOPE_GENERIC_TERMS
+        if len(scope_overlap) < 2:
+            penalties[index] = 0.75
+    return penalties
+
+
 def build_stale_source_penalties(query: str, chunks: list[Chunk]) -> dict[int, float]:
-    current_intent = re.search(
-        r"\b(current|latest|now|authoritative|authority|go-live)\b",
+    historical_intent = re.search(
+        r"\b(archive|archived|both|compare|historical|history|old|previous|prior|superseded)\b",
         query,
         flags=re.IGNORECASE,
     )
-    if not current_intent:
+    if historical_intent:
         return {}
+
+    current_intent = re.search(
+        r"\b(blocking|current|decision|go-live|latest|now|paused|required|restart|resume|"
+        r"authoritative|authority)\b",
+        query,
+        flags=re.IGNORECASE,
+    )
 
     stale_pattern = re.compile(
         r"\b(archive|archived|superseded|obsolete|deprecated|outdated)\b",
         flags=re.IGNORECASE,
     )
     return {
-        index: 0.45
+        index: 1.25 if current_intent else 0.30
         for index, chunk in enumerate(chunks)
         if stale_pattern.search(f"{chunk.source} {chunk.text[:400]}")
     }
@@ -264,14 +395,24 @@ def mmr_select(
     top_k: int,
     lambda_mult: float = 0.7,
     relevance_scores: dict[int, float] | None = None,
+    source_ids: dict[int, str] | None = None,
 ) -> list[int]:
     chosen: list[int] = []
     remaining = candidate_indices.copy()
 
     while remaining and len(chosen) < top_k:
-        best_idx = remaining[0]
+        remaining_sources = (
+            {source_ids[index] for index in remaining} if source_ids else set()
+        )
+        chosen_sources = {source_ids[index] for index in chosen} if source_ids else set()
+        eligible = (
+            [index for index in remaining if source_ids[index] not in chosen_sources]
+            if source_ids and remaining_sources - chosen_sources
+            else remaining
+        )
+        best_idx = eligible[0]
         best_score = -1e9
-        for idx in remaining:
+        for idx in eligible:
             rel = (
                 relevance_scores[idx]
                 if relevance_scores is not None
@@ -724,6 +865,7 @@ def run_query_payload(
     dense_index = payload["dense"]
     vectorizer: TfidfVectorizer = payload["vectorizer"]
     lexical_matrix = payload["lexical_matrix"]
+    source_scope_matrix = payload["source_scope_matrix"]
     labels: np.ndarray = payload["cluster_labels"]
     keywords: dict[int, list[str]] = payload["cluster_keywords"]
     model_name: str = payload["meta"]["embedding_model"]
@@ -753,16 +895,25 @@ def run_query_payload(
 
     query_lex = vectorizer.transform([query])
     lex_scores_all = (lexical_matrix @ query_lex.T).toarray().ravel()
+    source_scope_scores_all = (source_scope_matrix @ query_lex.T).toarray().ravel()
 
     dense_norm = normalize_scores(dense_scores)
     lex_subset = np.asarray([lex_scores_all[i] for i in dense_indices], dtype=np.float32)
     lex_norm = normalize_scores(lex_subset)
+    source_scope_subset = np.asarray(
+        [source_scope_scores_all[i] for i in dense_indices],
+        dtype=np.float32,
+    )
+    source_scope_norm = normalize_scores(source_scope_subset)
 
-    hybrid = 0.7 * dense_norm + 0.3 * lex_norm
+    hybrid = 0.60 * dense_norm + 0.25 * lex_norm + 0.15 * source_scope_norm
     stale_penalties = build_stale_source_penalties(query, chunks)
+    scope_mismatch_penalties = build_scope_mismatch_penalties(query, chunks)
     adjusted_hybrid = np.asarray(
         [
-            float(hybrid[position]) - stale_penalties.get(int(dense_indices[position]), 0.0)
+            float(hybrid[position])
+            - stale_penalties.get(int(dense_indices[position]), 0.0)
+            - scope_mismatch_penalties.get(int(dense_indices[position]), 0.0)
             for position in range(len(dense_indices))
         ],
         dtype=np.float32,
@@ -781,6 +932,7 @@ def run_query_payload(
         top_k=top_k,
         lambda_mult=mmr_lambda,
         relevance_scores=hybrid_by_index,
+        source_ids={index: chunk.source for index, chunk in enumerate(chunks)},
     )
 
     selected_rows: list[dict[str, Any]] = []
@@ -795,7 +947,9 @@ def run_query_payload(
                 "constellation": f"K{label} ({theme})",
                 "dense": float(np.dot(query_vec, embeddings[idx])),
                 "lex": float(lex_scores_all[idx]),
+                "source_scope": float(source_scope_scores_all[idx]),
                 "stale_source_penalty": stale_penalties.get(idx, 0.0),
+                "scope_mismatch_penalty": scope_mismatch_penalties.get(idx, 0.0),
             }
         )
 
@@ -887,6 +1041,7 @@ def command_index(args: argparse.Namespace) -> None:
 
     vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_features=7000)
     lexical_matrix = vectorizer.fit_transform(retrieval_texts)
+    source_scope_matrix = vectorizer.transform([build_source_scope_text(chunk) for chunk in chunks])
 
     cluster_count = max(2, min(8, len(chunks) // 4))
     kmeans = KMeans(n_clusters=cluster_count, random_state=42, n_init="auto")
@@ -900,6 +1055,7 @@ def command_index(args: argparse.Namespace) -> None:
         faiss_index=dense,
         vectorizer=vectorizer,
         tfidf_matrix=lexical_matrix,
+        source_scope_matrix=source_scope_matrix,
         cluster_labels=labels,
         cluster_keywords=keywords,
         model_name=args.embedding_model,
