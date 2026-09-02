@@ -11,11 +11,13 @@ from main import (
     build_conflict_source_metrics,
     build_expected_source_metrics,
     build_forbidden_source_metrics,
+    build_non_evidence_penalties,
     build_quality_gate,
     build_retrieval_text,
     build_scope_mismatch_penalties,
     build_source_scope_text,
     build_stale_source_penalties,
+    expand_query_for_retrieval,
     mmr_select,
     read_corpus,
     unit_interval,
@@ -135,6 +137,49 @@ class RetrievalContractTests(unittest.TestCase):
         )
         self.assertEqual(
             build_scope_mismatch_penalties("What does the search latency review conclude?", chunks),
+            {},
+        )
+
+    def test_offline_query_expansion_bridges_gate_paraphrases(self) -> None:
+        expanded = expand_query_for_retrieval(
+            "Which teams must sign off and what proof do they need to restart?"
+        )
+
+        self.assertIn("approval", expanded)
+        self.assertIn("evidence", expanded)
+        self.assertIn("resume", expanded)
+        self.assertIn("requires", expanded)
+        self.assertIn(
+            "approval",
+            expand_query_for_retrieval("What approvals are still required?"),
+        )
+        generic_query = "What evidence is blocking the launch?"
+        self.assertEqual(expand_query_for_retrieval(generic_query), generic_query)
+
+    def test_non_evidence_penalty_requires_intent_and_subject_overlap(self) -> None:
+        chunks = [
+            Chunk(
+                "load::c1",
+                "engineering/load_test.md",
+                "This test did not validate invoice tax correctness. "
+                "Healthy load must not be treated as approval of VAT calculations.",
+                0,
+                119,
+            )
+        ]
+
+        self.assertEqual(
+            build_non_evidence_penalties(
+                "Which evidence confirms the invoice tax defect?",
+                chunks,
+            ),
+            {0: 0.60},
+        )
+        self.assertEqual(
+            build_non_evidence_penalties(
+                "Was service latency the root cause?",
+                chunks,
+            ),
             {},
         )
 

@@ -319,6 +319,66 @@ SCOPE_GENERIC_TERMS = {
 }
 
 
+RETRIEVAL_EQUIVALENCE_GROUPS = (
+    (
+        ("approve", "approval", "approvals", "approved", "sign off", "sign-off"),
+        ("approve", "approval", "approvals", "approved", "sign off", "sign-off"),
+    ),
+    (
+        ("resume", "resumption", "restart", "reopen"),
+        ("resume", "resumption", "restart", "reopen"),
+    ),
+    (
+        (
+            "agree",
+            "agreement",
+            "confirm",
+            "confirmation",
+            "corroborate",
+            "corroboration",
+            "proof",
+            "validate",
+            "validation",
+        ),
+        (
+            "agree",
+            "agreement",
+            "confirm",
+            "confirmation",
+            "corroborate",
+            "corroboration",
+            "evidence",
+            "proof",
+            "validate",
+            "validation",
+        ),
+    ),
+    (
+        ("require", "required", "requirement", "requires", "depends", "must"),
+        ("require", "required", "requirement", "requires", "depends", "must"),
+    ),
+)
+
+
+def expand_query_for_retrieval(query: str) -> str:
+    """Add a small, deterministic synonym bridge for offline retrieval.
+
+    TF-IDF cannot infer that, for example, "restart" and "resume" describe the
+    same gate. Keep the bridge deliberately narrow and append-only so the
+    original wording remains the strongest query signal. A generic term such as
+    "evidence" is an expansion target, not a trigger, because broadening every
+    evidence question would erase useful subject terms.
+    """
+    lowered = query.lower()
+    expansions: list[str] = []
+    for triggers, terms in RETRIEVAL_EQUIVALENCE_GROUPS:
+        if any(re.search(rf"\b{re.escape(term)}\b", lowered) for term in triggers):
+            expansions.extend(term.replace("-", " ") for term in terms)
+    if not expansions:
+        return query
+    return f"{query} {' '.join(dict.fromkeys(expansions))}"
+
+
 def scope_tokens(value: str) -> set[str]:
     return {
         token
@@ -358,6 +418,46 @@ def build_scope_mismatch_penalties(query: str, chunks: list[Chunk]) -> dict[int,
         ) - SCOPE_GENERIC_TERMS
         if len(scope_overlap) < 2:
             penalties[index] = 0.75
+    return penalties
+
+
+def build_non_evidence_penalties(query: str, chunks: list[Chunk]) -> dict[int, float]:
+    """Demote lexical near-matches that explicitly disclaim evidentiary value.
+
+    The penalty only applies to evidence/approval questions and only when the
+    disclaimer sentence overlaps the query subject. This preserves negative
+    evidence for questions such as whether latency caused an incident while
+    preventing "did not validate invoice correctness" from outranking an
+    invoice reconciliation that actually confirms the defect.
+    """
+    evidence_intent = re.search(
+        r"\b(agree|approv\w*|confirm\w*|corroborat\w*|evidence|proof|"
+        r"require\w*|restart|resume|sign[ -]off|validat\w*)\b",
+        query,
+        flags=re.IGNORECASE,
+    )
+    if not evidence_intent:
+        return {}
+
+    query_terms = scope_tokens(expand_query_for_retrieval(query)) - SCOPE_GENERIC_TERMS
+    disclaimer_pattern = re.compile(
+        r"\b(did not validate|does not (?:confirm|support|validate)|has no evidence|"
+        r"contains no evidence|must not be treated as approval|not approval for|"
+        r"no relationship to|unrelated to)\b",
+        flags=re.IGNORECASE,
+    )
+    penalties: dict[int, float] = {}
+    for index, chunk in enumerate(chunks):
+        sentences = re.split(r"(?<=[.!?])\s+", chunk.text)
+        disclaimer_sentences = [sentence for sentence in sentences if disclaimer_pattern.search(sentence)]
+        if not disclaimer_sentences:
+            continue
+        disclaimer_terms: set[str] = set()
+        for sentence in disclaimer_sentences:
+            disclaimer_terms.update(scope_tokens(sentence) - SCOPE_GENERIC_TERMS)
+        overlap = len(query_terms & disclaimer_terms)
+        if overlap >= 2:
+            penalties[index] = 0.60
     return penalties
 
 
@@ -872,6 +972,7 @@ def run_query_payload(
 
     if embedder is None:
         embedder = EmbeddingEngine(model_name=model_name)
+    retrieval_query = expand_query_for_retrieval(query)
     query_vec = embedder.encode([query])[0]
 
     filtered_indices = list(range(len(chunks)))
@@ -893,7 +994,7 @@ def run_query_payload(
         dense_scores = scores[0]
         dense_indices = idxs[0]
 
-    query_lex = vectorizer.transform([query])
+    query_lex = vectorizer.transform([retrieval_query])
     lex_scores_all = (lexical_matrix @ query_lex.T).toarray().ravel()
     source_scope_scores_all = (source_scope_matrix @ query_lex.T).toarray().ravel()
 
@@ -909,11 +1010,13 @@ def run_query_payload(
     hybrid = 0.60 * dense_norm + 0.25 * lex_norm + 0.15 * source_scope_norm
     stale_penalties = build_stale_source_penalties(query, chunks)
     scope_mismatch_penalties = build_scope_mismatch_penalties(query, chunks)
+    non_evidence_penalties = build_non_evidence_penalties(query, chunks)
     adjusted_hybrid = np.asarray(
         [
             float(hybrid[position])
             - stale_penalties.get(int(dense_indices[position]), 0.0)
             - scope_mismatch_penalties.get(int(dense_indices[position]), 0.0)
+            - non_evidence_penalties.get(int(dense_indices[position]), 0.0)
             for position in range(len(dense_indices))
         ],
         dtype=np.float32,
@@ -950,6 +1053,7 @@ def run_query_payload(
                 "source_scope": float(source_scope_scores_all[idx]),
                 "stale_source_penalty": stale_penalties.get(idx, 0.0),
                 "scope_mismatch_penalty": scope_mismatch_penalties.get(idx, 0.0),
+                "non_evidence_penalty": non_evidence_penalties.get(idx, 0.0),
             }
         )
 
@@ -973,6 +1077,7 @@ def run_query_payload(
 
     return {
         "query": query,
+        "retrieval_query": retrieval_query,
         "answer": answer,
         "answer_mode": answer_mode,
         "evidence": selected_rows,
@@ -1212,6 +1317,10 @@ def write_markdown_report(result: dict[str, Any], output_path: Path) -> None:
                 f"- Constellation: {row['constellation']}",
                 f"- Dense score: {row['dense']:.4f}",
                 f"- Lexical score: {row['lex']:.4f}",
+                f"- Source-scope score: {row['source_scope']:.4f}",
+                f"- Stale-source penalty: {row['stale_source_penalty']:.2f}",
+                f"- Scope-mismatch penalty: {row['scope_mismatch_penalty']:.2f}",
+                f"- Non-evidence penalty: {row['non_evidence_penalty']:.2f}",
                 f"- Snippet: {snippet}",
                 "",
             ]
@@ -1232,6 +1341,7 @@ def write_markdown_report(result: dict[str, Any], output_path: Path) -> None:
         "## Query Scope",
         "",
         f"- Source filter: {result['source_filter'] or 'none'}",
+        f"- Retrieval query: {result['retrieval_query']}",
         "",
         "## Source Breakdown",
         "",
@@ -1479,6 +1589,7 @@ def evaluate_query_suite(
             "query_index": idx,
             "label": entry.get("label"),
             "query": result["query"],
+            "retrieval_query": result["retrieval_query"],
             "answer_mode": mode,
             "source_filter": source_filter,
             "expected_sources": expected_sources,
@@ -1757,6 +1868,7 @@ def command_ask(args: argparse.Namespace) -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         serializable = {
             "query": result["query"],
+            "retrieval_query": result["retrieval_query"],
             "answer": result["answer"],
             "answer_mode": result["answer_mode"],
             "source_count": result["source_count"],
@@ -1773,7 +1885,10 @@ def command_ask(args: argparse.Namespace) -> None:
                     "constellation": row["constellation"],
                     "dense": row["dense"],
                     "lex": row["lex"],
+                    "source_scope": row["source_scope"],
                     "stale_source_penalty": row["stale_source_penalty"],
+                    "scope_mismatch_penalty": row["scope_mismatch_penalty"],
+                    "non_evidence_penalty": row["non_evidence_penalty"],
                     "chunk": asdict(row["chunk"]),
                 }
                 for row in result["evidence"]

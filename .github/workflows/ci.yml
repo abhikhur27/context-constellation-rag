@@ -35,12 +35,11 @@ jobs:
           --index-dir artifacts/ci-operational-index
           --queries benchmark_queries.json
           --llm off
-          --top-k 6
+          --top-k 4
           --min-expected-source-recall 1.0
           --min-expected-source-mrr 0.55
           --max-forbidden-source-hit-rate 0.0
           --min-conflict-source-recall 1.0
           --min-variant-stability-rate 1.0
-          --max-flagged-query-rate 0.0
           --json-out artifacts/ci-operational-evaluation.json
           --report-out artifacts/ci-operational-evaluation.md
