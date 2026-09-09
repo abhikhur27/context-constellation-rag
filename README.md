@@ -21,6 +21,8 @@ Instead of only returning nearest chunks, this project groups retrieved evidence
 - `map`: Inspect the discovered constellation clusters and dominant themes
 - `evaluate`: Run a repeatable query suite, check paraphrase stability, and flag weak evidence patterns before demoing or iterating
 
+`ask` now has an absolute grounding gate in addition to relative ranking. If no selected source directly covers enough of the requested subject, it returns `Insufficient evidence` instead of turning the closest topical match into an answer. JSON and Markdown outputs retain the closest-source trace plus the shared-term and query-coverage decision so abstention is auditable.
+
 Source paths are normalized across operating systems and included as searchable metadata. Dense relevance, lexical relevance, and source/title alignment feed the MMR selection step, which favors distinct sources before returning multiple chunks from one document. A narrow synonym bridge makes operational gate questions stable under wording such as `restart`/`resume`, `proof`/`evidence`, and `sign off`/`approval` without rewriting the dense semantic query. Queries asking for a current decision strongly demote archived or superseded evidence, while explicitly historical queries keep it eligible. Documents that disclaim the query's subject or explicitly say they did not validate the requested evidence are demoted only when the disclaimer overlaps the question's subject.
 
 ## Quick start
@@ -102,7 +104,8 @@ Export the evaluation as JSON + Markdown for a portfolio-ready validation artifa
 python main.py evaluate --index-dir artifacts/index --queries example_queries.json --llm off --json-out artifacts/test-eval.json --report-out artifacts/test-eval.md
 ```
 
-Each evaluation query can be a plain string or an object with `query`, optional `label`, optional `source_filter`, optional `expected_sources`, optional `forbidden_sources`, optional `conflict_source_groups`, and optional `variants`.
+Each evaluation query can be a plain string or an object with `query`, optional `label`, optional `source_filter`, optional `expected_outcome`, optional `expected_sources`, optional `forbidden_sources`, optional `conflict_source_groups`, and optional `variants`.
+Set `expected_outcome` to `answer` or `abstain` to test whether the grounding gate answers supported questions and refuses unsupported ones. Variants inherit the primary query's expected outcome.
 Use `expected_sources` to declare regex patterns over source paths that should show up in the evidence trail, and `variants` to provide alternate phrasings that stress-test retrieval stability.
 Use `forbidden_sources` for known distractor patterns that must stay out of the first three evidence ranks. Use `conflict_source_groups` to require all sides of a documented disagreement to appear together; each group is an array of at least two source regexes.
 The evaluation summary now highlights answer-mode mix, coverage posture, agreement mix, expected-source misses, and whether a question stays stable across paraphrases or turns brittle under rewording.
@@ -145,6 +148,7 @@ python main.py evaluate \
   --min-expected-source-mrr 0.30 \
   --min-variant-stability-rate 0.75 \
   --max-flagged-query-rate 0.25 \
+  --min-answerability-accuracy 1.0 \
   --json-out artifacts/evaluation.json \
   --report-out artifacts/evaluation.md
 ```
@@ -166,14 +170,40 @@ python main.py evaluate \
   --min-expected-source-mrr 0.55 \
   --max-forbidden-source-hit-rate 0.0 \
   --min-conflict-source-recall 1.0 \
-  --min-variant-stability-rate 1.0
+  --min-variant-stability-rate 1.0 \
+  --min-answerability-accuracy 1.0
 ```
 
 This gate tests source recall, rank quality, near-match distractors, cross-source conflicts, and paraphrase stability without downloading an embedding model or calling an LLM. The frozen hashing benchmark now requires full expected-source and conflict recall within four evidence slots, no forbidden source in the first three ranks, and stable retrieval for every checked paraphrase. The smaller evidence budget prevents the fixture from passing by returning most of its corpus.
 
+### Independent grounding benchmark
+
+`grounding_corpus/` is a separately authored, fictional database-recovery fixture. It is original repository content rather than redistributed third-party text. Its suite mixes supported cutover questions with adjacent but unanswerable requests for customer compensation and hardware-delivery details.
+
+Run the second CI promotion gate:
+
+```bash
+python main.py index --corpus grounding_corpus --index-dir artifacts/grounding-index --embedding-model hashing
+python main.py evaluate \
+  --index-dir artifacts/grounding-index \
+  --queries grounding_queries.json \
+  --llm off \
+  --top-k 4 \
+  --min-expected-source-recall 0.875 \
+  --min-expected-source-mrr 0.54 \
+  --max-forbidden-source-hit-rate 0.0 \
+  --min-variant-stability-rate 0.50 \
+  --min-answerability-accuracy 1.0 \
+  --min-abstention-recall 1.0
+```
+
+The workflow requires retrieval changes to preserve the checkout evidence contract and this independent answer/abstain contract. A relative top result is no longer sufficient proof that the corpus can answer a question.
+
+At the four-source budget, the independent fixture freezes 0.875 expected-source recall, 0.5469 MRR, zero top-three distractor hits, and perfect answerability/abstention classification; these values are explicit baselines rather than claims of general RAG quality.
+
 Answer JSON and Markdown reports include the expanded lexical retrieval query plus source-scope, stale-source, scope-mismatch, and non-evidence penalties for each selected chunk. Ranking behavior is therefore inspectable rather than hidden behind one aggregate score.
 
-All thresholds are optional values from `0` to `1`. The checked-in CI workflow builds a hashing index, runs the unit suite, and enforces the sample corpus gate without network-dependent embeddings.
+All thresholds are optional values from `0` to `1`. The checked-in CI workflow builds deterministic hashing indexes, runs the unit suite, and enforces all three corpus gates without network-dependent embeddings.
 
 ## Optional LLM mode
 
@@ -210,6 +240,7 @@ It also surfaces a quick evidence-coverage badge so demo viewers can tell when a
 - `main.py`: end-to-end pipeline (ingest, embed, index, retrieve, answer)
 - `example_queries.json`: starter evaluation suite with source expectations and paraphrase variants
 - `benchmark_corpus/` and `benchmark_queries.json`: heterogeneous offline retrieval regression fixture
+- `grounding_corpus/` and `grounding_queries.json`: independent answerability and abstention fixture
 - `tests/test_evaluation.py`: deterministic coverage for rank metrics, gates, and offline embeddings
 - `web_app.py`: tiny local browser UI for query + citation trace
 - `example_corpus/`: sample documents for demo

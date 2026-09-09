@@ -8,9 +8,11 @@ import numpy as np
 from main import (
     Chunk,
     EmbeddingEngine,
+    build_answerability_metrics,
     build_conflict_source_metrics,
     build_expected_source_metrics,
     build_forbidden_source_metrics,
+    build_grounding_decision,
     build_non_evidence_penalties,
     build_quality_gate,
     build_retrieval_text,
@@ -20,6 +22,7 @@ from main import (
     expand_query_for_retrieval,
     mmr_select,
     read_corpus,
+    load_query_suite,
     unit_interval,
 )
 
@@ -115,6 +118,18 @@ class RetrievalContractTests(unittest.TestCase):
         self.assertEqual(
             build_source_scope_text(chunk),
             "search search latency review. Search Latency Review",
+        )
+
+        ascii_heading = Chunk(
+            "recovery::c1",
+            "recovery/restore_drill.md",
+            "# Restore Drill Record - 2026-08-12 This body mentions unrelated invoices.",
+            0,
+            77,
+        )
+        self.assertEqual(
+            build_source_scope_text(ascii_heading),
+            "recovery restore drill. Restore Drill Record",
         )
 
     def test_scope_disclaimer_is_demoted_unless_query_names_its_subject(self) -> None:
@@ -241,6 +256,63 @@ class RetrievalContractTests(unittest.TestCase):
 
         self.assertEqual(selected, [0, 2])
 
+    def test_grounding_decision_abstains_when_subject_details_are_missing(self) -> None:
+        rows = [
+            evidence_row(1, "finance/migration_budget.md"),
+            evidence_row(2, "operations/cutover_hold.md"),
+        ]
+        rows[0]["chunk"].text = "The database migration budget remains approved."
+        rows[1]["chunk"].text = "The database cutover remains paused."
+
+        supported = build_grounding_decision(
+            "Why is the database cutover paused?",
+            rows,
+        )
+        unsupported = build_grounding_decision(
+            "What customer compensation amount and notification deadline were approved after the migration delay?",
+            rows,
+        )
+
+        self.assertEqual(supported["outcome"], "answer")
+        self.assertEqual(unsupported["outcome"], "abstain")
+        self.assertLess(unsupported["best_query_coverage"], 0.40)
+
+    def test_query_suite_validates_expected_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            suite_path = Path(temp_dir) / "queries.json"
+            suite_path.write_text(
+                '[{"query":"Known?","expected_outcome":"answer"},'
+                '{"query":"Unknown?","expected_outcome":"abstain"}]',
+                encoding="utf-8",
+            )
+            suite = load_query_suite(suite_path)
+            self.assertEqual(
+                [item["expected_outcome"] for item in suite],
+                ["answer", "abstain"],
+            )
+
+            suite_path.write_text(
+                '[{"query":"Maybe?","expected_outcome":"guess"}]',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(SystemExit, "expected_outcome"):
+                load_query_suite(suite_path)
+
+
+class AnswerabilityMetricTests(unittest.TestCase):
+    def test_metrics_keep_abstention_recall_visible(self) -> None:
+        metrics = build_answerability_metrics(
+            [
+                {"label": "a", "expected_outcome": "answer", "actual_outcome": "answer"},
+                {"label": "b", "expected_outcome": "abstain", "actual_outcome": "abstain"},
+                {"label": "c", "expected_outcome": "abstain", "actual_outcome": "answer"},
+            ]
+        )
+
+        self.assertEqual(metrics["accuracy"], 0.6667)
+        self.assertEqual(metrics["abstention_recall"], 0.5)
+        self.assertEqual(metrics["answer_recall"], 1.0)
+
 
 class QualityGateTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -251,6 +323,8 @@ class QualityGateTests(unittest.TestCase):
             "flagged_query_rate": 0.1,
             "forbidden_source_hit_rate": 0.0,
             "conflict_source_recall": 1.0,
+            "answerability_accuracy": 1.0,
+            "abstention_recall": 1.0,
         }
 
     def test_gate_passes_at_configured_thresholds(self) -> None:
@@ -262,6 +336,8 @@ class QualityGateTests(unittest.TestCase):
             max_flagged_query_rate=0.1,
             max_forbidden_source_hit_rate=0.0,
             min_conflict_source_recall=1.0,
+            min_answerability_accuracy=1.0,
+            min_abstention_recall=1.0,
         )
 
         self.assertTrue(gate["configured"])
@@ -298,6 +374,25 @@ class QualityGateTests(unittest.TestCase):
         self.assertEqual(
             [check["metric"] for check in gate["checks"] if not check["passed"]],
             ["forbidden_source_hit_rate", "conflict_source_recall"],
+        )
+
+    def test_gate_enforces_answerability_and_abstention_contracts(self) -> None:
+        summary = {
+            **self.summary,
+            "answerability_accuracy": 0.75,
+            "abstention_recall": 0.5,
+        }
+
+        gate = build_quality_gate(
+            summary=summary,
+            min_answerability_accuracy=1.0,
+            min_abstention_recall=1.0,
+        )
+
+        self.assertFalse(gate["passed"])
+        self.assertEqual(
+            [check["metric"] for check in gate["checks"] if not check["passed"]],
+            ["answerability_accuracy", "abstention_recall"],
         )
 
 

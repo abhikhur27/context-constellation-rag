@@ -392,7 +392,12 @@ def build_source_scope_text(chunk: Chunk) -> str:
     source_terms = re.sub(r"[/\\_.-]+", " ", source_without_suffix).strip()
     heading = ""
     if chunk.text.startswith("#"):
-        heading = chunk.text.lstrip("# ").split("—", 1)[0].strip()
+        heading_text = chunk.text.lstrip("# ")
+        heading = re.split(
+            r"\s+(?:—|-)\s+\d{4}-\d{2}-\d{2}\b",
+            heading_text,
+            maxsplit=1,
+        )[0].strip()
     return f"{source_terms}. {heading}".strip()
 
 
@@ -406,7 +411,8 @@ def build_scope_mismatch_penalties(query: str, chunks: list[Chunk]) -> dict[int,
     query_terms = scope_tokens(query)
     disclaimer_pattern = re.compile(
         r"\b(no relationship to|concerns .{0,80}? only|not approval for|"
-        r"unrelated to|outside (?:the )?scope|does not (?:cover|address|apply))\b",
+        r"unrelated to|outside (?:the )?scope|does not (?:cover|address|apply)|"
+        r"(?:is|are) not .{0,60}? evidence)\b",
         flags=re.IGNORECASE,
     )
     penalties: dict[int, float] = {}
@@ -547,6 +553,124 @@ def build_extractive_answer(query: str, selected_rows: list[dict[str, Any]]) -> 
     lines.append("")
     lines.append("Suggested next action: validate the strongest claim against at least one chunk from a different constellation before finalizing decisions.")
     return "\n".join(lines)
+
+
+def build_grounding_decision(
+    query: str,
+    selected_rows: list[dict[str, Any]],
+    *,
+    min_query_coverage: float = 0.28,
+    min_specific_query_coverage: float = 0.35,
+    min_union_query_coverage: float = 0.50,
+) -> dict[str, Any]:
+    """Decide whether retrieved evidence directly supports the question.
+
+    Ranking is relative, so even an unrelated question always has a top result.
+    This gate instead measures absolute overlap between the meaningful query
+    terms and each selected source. It is intentionally conservative: short
+    questions need one directly shared term, while longer questions need at
+    least two and must cover a substantial share of the requested subject.
+    """
+    query_terms = scope_tokens(query)
+    required_shared_terms = 1 if len(query_terms) <= 3 else 2
+    requests_specific_detail = bool(
+        re.search(
+            r"\b(amount|carrier|case number|deadline|delivery|exact|identifier|"
+            r"how much|shipment|ticket|tracking)\b",
+            query,
+            flags=re.IGNORECASE,
+        )
+    )
+    required_query_coverage = (
+        min_specific_query_coverage if requests_specific_detail else min_query_coverage
+    )
+    details = []
+    union_evidence_terms: set[str] = set()
+
+    for row in selected_rows:
+        chunk: Chunk = row["chunk"]
+        evidence_terms = scope_tokens(
+            f"{build_source_scope_text(chunk)} {chunk.text}"
+        )
+        union_evidence_terms.update(evidence_terms)
+        shared_terms = sorted(query_terms & evidence_terms)
+        coverage = len(shared_terms) / len(query_terms) if query_terms else 0.0
+        details.append(
+            {
+                "rank": int(row["rank"]),
+                "source": chunk.source,
+                "shared_terms": shared_terms,
+                "shared_term_count": len(shared_terms),
+                "query_coverage": round(coverage, 4),
+                "dense_score": round(float(row.get("dense", 0.0)), 4),
+                "lexical_score": round(float(row.get("lex", 0.0)), 4),
+                "source_scope_score": round(float(row.get("source_scope", 0.0)), 4),
+            }
+        )
+
+    best_coverage = max((item["query_coverage"] for item in details), default=0.0)
+    best_shared_count = max((item["shared_term_count"] for item in details), default=0)
+    best_dense_score = max((item["dense_score"] for item in details), default=0.0)
+    best_lexical_score = max((item["lexical_score"] for item in details), default=0.0)
+    union_shared_terms = sorted(query_terms & union_evidence_terms)
+    union_coverage = len(union_shared_terms) / len(query_terms) if query_terms else 0.0
+    best_rows = [
+        item
+        for item in details
+        if item["query_coverage"] == best_coverage
+        and item["shared_term_count"] == best_shared_count
+    ]
+    short_query_supported = (
+        len(query_terms) <= 3
+        and best_shared_count >= 1
+        and best_coverage >= 0.32
+    )
+    single_source_supported = (
+        best_shared_count >= required_shared_terms
+        and best_coverage >= required_query_coverage
+    )
+    cross_source_supported = (
+        len(union_shared_terms) >= required_shared_terms
+        and union_coverage >= min_union_query_coverage
+    )
+    supported = bool(query_terms) and (
+        short_query_supported or single_source_supported or cross_source_supported
+    )
+
+    return {
+        "outcome": "answer" if supported else "abstain",
+        "label": "supported" if supported else "insufficient-evidence",
+        "query_terms": sorted(query_terms),
+        "query_term_count": len(query_terms),
+        "required_shared_terms": required_shared_terms,
+        "min_query_coverage": min_query_coverage,
+        "min_specific_query_coverage": min_specific_query_coverage,
+        "requests_specific_detail": requests_specific_detail,
+        "required_query_coverage": required_query_coverage,
+        "min_union_query_coverage": min_union_query_coverage,
+        "best_shared_term_count": best_shared_count,
+        "best_query_coverage": best_coverage,
+        "best_dense_score": best_dense_score,
+        "best_lexical_score": best_lexical_score,
+        "union_shared_terms": union_shared_terms,
+        "union_shared_term_count": len(union_shared_terms),
+        "union_query_coverage": round(union_coverage, 4),
+        "best_sources": [item["source"] for item in best_rows],
+        "details": details,
+    }
+
+
+def build_abstention_answer(query: str, grounding: dict[str, Any]) -> str:
+    closest = ", ".join(grounding["best_sources"]) or "none"
+    return "\n".join(
+        [
+            f"Question: {query}",
+            "",
+            "Insufficient evidence: the indexed corpus does not directly support this claim or requested detail.",
+            f"Closest source(s) for manual review: {closest}.",
+            "Do not infer an answer from lexical or topical similarity alone.",
+        ]
+    )
 
 
 def build_llm_answer(query: str, selected_rows: list[dict[str, Any]], model: str) -> str:
@@ -709,6 +833,7 @@ def build_variant_stability_summary(
     primary_chunks = chunk_id_set(primary_result)
     primary_posture = primary_result["evidence_posture"]
     primary_agreement = primary_result["agreement_signal"]["label"]
+    primary_grounding = primary_result["grounding"]["outcome"]
     details = []
 
     for variant in variant_results:
@@ -728,6 +853,7 @@ def build_variant_stability_summary(
                     and primary_posture["tension_label"] == variant["result"]["evidence_posture"]["tension_label"]
                 ),
                 "agreement_match": primary_agreement == variant["result"]["agreement_signal"]["label"],
+                "grounding_match": primary_grounding == variant["result"]["grounding"]["outcome"],
                 "source_count": variant["result"]["source_count"],
                 "expected_source_recall": variant.get("expected_source_metrics", {}).get("recall_at_k"),
                 "missing_expected_sources": [
@@ -743,12 +869,19 @@ def build_variant_stability_summary(
     avg_chunk_overlap = round(mean(item["chunk_overlap"] for item in details), 4)
     posture_mismatch_count = sum(1 for item in details if not item["posture_match"])
     agreement_mismatch_count = sum(1 for item in details if not item["agreement_match"])
-    stable = (
-        avg_source_overlap >= 0.5
-        and avg_constellation_overlap >= 0.5
-        and posture_mismatch_count == 0
-        and agreement_mismatch_count <= 1
-    )
+    grounding_stable = all(item["grounding_match"] for item in details)
+    if primary_grounding == "abstain":
+        # Once every phrasing abstains, disagreement among the nearest rejected
+        # sources is not answer instability; none of them is being asserted.
+        stable = grounding_stable
+    else:
+        stable = (
+            avg_source_overlap >= 0.5
+            and avg_constellation_overlap >= 0.5
+            and posture_mismatch_count == 0
+            and agreement_mismatch_count <= 1
+            and grounding_stable
+        )
 
     return {
         "variant_count": len(details),
@@ -897,6 +1030,38 @@ def build_conflict_source_metrics(
     }
 
 
+def build_answerability_metrics(cases: list[dict[str, str]]) -> dict[str, Any]:
+    correct_count = sum(
+        1 for case in cases if case["expected_outcome"] == case["actual_outcome"]
+    )
+    abstention_cases = [case for case in cases if case["expected_outcome"] == "abstain"]
+    correct_abstentions = sum(
+        1 for case in abstention_cases if case["actual_outcome"] == "abstain"
+    )
+    answer_cases = [case for case in cases if case["expected_outcome"] == "answer"]
+    correct_answers = sum(
+        1 for case in answer_cases if case["actual_outcome"] == "answer"
+    )
+    return {
+        "case_count": len(cases),
+        "correct_count": correct_count,
+        "accuracy": round(correct_count / len(cases), 4) if cases else None,
+        "expected_abstention_count": len(abstention_cases),
+        "correct_abstention_count": correct_abstentions,
+        "abstention_recall": (
+            round(correct_abstentions / len(abstention_cases), 4)
+            if abstention_cases
+            else None
+        ),
+        "expected_answer_count": len(answer_cases),
+        "correct_answer_count": correct_answers,
+        "answer_recall": (
+            round(correct_answers / len(answer_cases), 4) if answer_cases else None
+        ),
+        "details": cases,
+    }
+
+
 def build_quality_gate(
     *,
     summary: dict[str, Any],
@@ -906,6 +1071,8 @@ def build_quality_gate(
     max_flagged_query_rate: float | None = None,
     max_forbidden_source_hit_rate: float | None = None,
     min_conflict_source_recall: float | None = None,
+    min_answerability_accuracy: float | None = None,
+    min_abstention_recall: float | None = None,
 ) -> dict[str, Any]:
     configured = [
         ("expected source recall", "expected_source_recall", min_expected_source_recall, ">="),
@@ -922,6 +1089,18 @@ def build_quality_gate(
             "conflict source recall",
             "conflict_source_recall",
             min_conflict_source_recall,
+            ">=",
+        ),
+        (
+            "answerability accuracy",
+            "answerability_accuracy",
+            min_answerability_accuracy,
+            ">=",
+        ),
+        (
+            "abstention recall",
+            "abstention_recall",
+            min_abstention_recall,
             ">=",
         ),
     ]
@@ -1057,8 +1236,12 @@ def run_query_payload(
             }
         )
 
+    grounding = build_grounding_decision(query, selected_rows)
     use_llm = llm_mode in {"on", "auto"}
-    if use_llm:
+    if grounding["outcome"] == "abstain":
+        answer = build_abstention_answer(query, grounding)
+        answer_mode = "abstained"
+    elif use_llm:
         try:
             answer = build_llm_answer(query, selected_rows, model=model)
             answer_mode = "llm"
@@ -1092,6 +1275,7 @@ def run_query_payload(
         },
         "evidence_posture": evidence_posture,
         "agreement_signal": agreement_signal,
+        "grounding": grounding,
         "source_filter": source_filter,
         "meta": payload["meta"],
     }
@@ -1331,6 +1515,9 @@ def write_markdown_report(result: dict[str, Any], output_path: Path) -> None:
         "",
         f"- Query: {result['query']}",
         f"- Answer mode: {result['answer_mode']}",
+        f"- Grounding: {result['grounding']['label']}",
+        f"- Best direct query coverage: {result['grounding']['best_query_coverage']:.2f}",
+        f"- Best shared terms: {result['grounding']['best_shared_term_count']}",
         f"- Source coverage: {result['source_count']} unique source(s)",
         f"- Embedding model: {result['meta'].get('embedding_model', 'unknown')}",
         "",
@@ -1396,11 +1583,17 @@ def load_query_suite(path: Path) -> list[dict[str, Any]]:
             continue
         if not isinstance(item, dict) or not str(item.get("query", "")).strip():
             raise SystemExit(f"Query suite entry {idx} is missing a non-empty 'query'.")
+        expected_outcome = str(item.get("expected_outcome", "")).strip().lower() or None
+        if expected_outcome not in {None, "answer", "abstain"}:
+            raise SystemExit(
+                f"Query suite entry {idx} expected_outcome must be 'answer' or 'abstain'."
+            )
         normalized.append(
             {
                 "query": str(item["query"]).strip(),
                 "label": str(item.get("label", "")).strip() or None,
                 "source_filter": str(item.get("source_filter", "")).strip() or None,
+                "expected_outcome": expected_outcome,
                 "expected_sources": [
                     str(source).strip()
                     for source in item.get("expected_sources", [])
@@ -1453,6 +1646,7 @@ def evaluate_query_suite(
     expected_metric_runs: list[dict[str, Any]] = []
     forbidden_metric_runs: list[dict[str, Any]] = []
     conflict_metric_runs: list[dict[str, Any]] = []
+    answerability_cases: list[dict[str, str]] = []
 
     for idx, entry in enumerate(queries, start=1):
         source_filter = entry.get("source_filter") or default_source_filter
@@ -1477,14 +1671,27 @@ def evaluate_query_suite(
         agreement_counts[agreement] = agreement_counts.get(agreement, 0) + 1
 
         risk_flags = []
-        if coverage == "narrow":
-            risk_flags.append("narrow coverage")
-        if tension == "concentrated":
-            risk_flags.append("concentrated evidence")
-        if agreement == "fragmented":
-            risk_flags.append("fragmented agreement")
-        if result["source_count"] <= 1:
-            risk_flags.append("single-source answer")
+        actual_outcome = result["grounding"]["outcome"]
+        expected_outcome = entry.get("expected_outcome")
+        if actual_outcome == "answer":
+            if coverage == "narrow":
+                risk_flags.append("narrow coverage")
+            if tension == "concentrated":
+                risk_flags.append("concentrated evidence")
+            if agreement == "fragmented":
+                risk_flags.append("fragmented agreement")
+            if result["source_count"] <= 1:
+                risk_flags.append("single-source answer")
+        if expected_outcome:
+            answerability_cases.append(
+                {
+                    "label": entry.get("label") or f"query-{idx}",
+                    "expected_outcome": expected_outcome,
+                    "actual_outcome": actual_outcome,
+                }
+            )
+            if actual_outcome != expected_outcome:
+                risk_flags.append("answerability mismatch")
 
         expected_sources = entry.get("expected_sources") or []
         expected_source_matches = find_expected_source_matches(
@@ -1536,6 +1743,14 @@ def evaluate_query_suite(
                 source_filter=variant_source_filter,
                 embedder=embedder,
             )
+            if expected_outcome:
+                answerability_cases.append(
+                    {
+                        "label": variant.get("label") or f"query-{idx}-variant-{variant_idx}",
+                        "expected_outcome": expected_outcome,
+                        "actual_outcome": variant_result["grounding"]["outcome"],
+                    }
+                )
             variant_expected_source_metrics = build_expected_source_metrics(
                 expected_sources=expected_sources,
                 evidence=variant_result["evidence"],
@@ -1591,6 +1806,8 @@ def evaluate_query_suite(
             "query": result["query"],
             "retrieval_query": result["retrieval_query"],
             "answer_mode": mode,
+            "expected_outcome": expected_outcome,
+            "actual_outcome": actual_outcome,
             "source_filter": source_filter,
             "expected_sources": expected_sources,
             "expected_source_matches": expected_source_matches,
@@ -1602,6 +1819,7 @@ def evaluate_query_suite(
             "source_count": result["source_count"],
             "evidence_posture": result["evidence_posture"],
             "agreement_signal": result["agreement_signal"],
+            "grounding": result["grounding"],
             "source_breakdown": result["source_breakdown"],
             "constellation_breakdown": result["constellation_breakdown"],
             "variant_stability": variant_stability,
@@ -1629,6 +1847,7 @@ def evaluate_query_suite(
         for item in results
         if item["variant_stability"]["variant_count"] and item["variant_stability"]["stable"]
     )
+    answerability_metrics = build_answerability_metrics(answerability_cases)
 
     summary = {
         "query_count": len(results),
@@ -1679,6 +1898,15 @@ def evaluate_query_suite(
         "variant_stability_rate": (
             round(stable_variant_query_count / variant_query_count, 4) if variant_query_count else 0.0
         ),
+        "answerability_case_count": answerability_metrics["case_count"],
+        "answerability_correct_count": answerability_metrics["correct_count"],
+        "answerability_accuracy": answerability_metrics["accuracy"] or 0.0,
+        "expected_abstention_count": answerability_metrics["expected_abstention_count"],
+        "correct_abstention_count": answerability_metrics["correct_abstention_count"],
+        "abstention_recall": answerability_metrics["abstention_recall"] or 0.0,
+        "expected_answer_count": answerability_metrics["expected_answer_count"],
+        "correct_answer_count": answerability_metrics["correct_answer_count"],
+        "answer_recall": answerability_metrics["answer_recall"] or 0.0,
         "avg_variant_source_overlap": round(
             mean(
                 item["variant_stability"]["avg_source_overlap"]
@@ -1703,6 +1931,7 @@ def evaluate_query_suite(
 
     return {
         "summary": summary,
+        "answerability": answerability_metrics,
         "results": results,
         "flagged_queries": flagged_queries,
     }
@@ -1737,6 +1966,9 @@ def write_evaluation_report(
         f"- Expected source MRR: {summary['expected_source_mrr']:.2f}",
         f"- Forbidden source hit rate (top {summary['forbidden_source_rank_cutoff']}): {forbidden_rate}",
         f"- Conflict source recall: {conflict_recall}",
+        f"- Answerability accuracy: {summary['answerability_accuracy']:.2f}",
+        f"- Abstention recall: {summary['abstention_recall']:.2f}",
+        f"- Answer recall: {summary['answer_recall']:.2f}",
         f"- Average source count: {summary['avg_source_count']}",
         f"- Average dominant source share: {summary['avg_dominant_source_share']:.2f}",
         f"- Average dominant constellation share: {summary['avg_dominant_constellation_share']:.2f}",
@@ -1784,6 +2016,7 @@ def write_evaluation_report(
                     f"### Q{item['query_index']}: {item['label'] or item['query']}",
                     f"- Query: {item['query']}",
                     f"- Flags: {', '.join(item['risk_flags'])}",
+                    f"- Expected / actual outcome: {item['expected_outcome'] or 'not declared'} / {item['actual_outcome']}",
                     f"- Posture: {item['evidence_posture']['coverage_label']} / {item['evidence_posture']['tension_label']}",
                     f"- Agreement: {item['agreement_signal']['label']}",
                     f"- Sources: {', '.join(f'{source} ({count})' for source, count in item['source_breakdown'].items())}",
@@ -1810,6 +2043,9 @@ def write_evaluation_report(
                 f"### Q{item['query_index']}: {item['label'] or item['query']}",
                 f"- Query: {item['query']}",
                 f"- Answer mode: {item['answer_mode']}",
+                f"- Expected outcome: {item['expected_outcome'] or 'not declared'}",
+                f"- Actual outcome: {item['actual_outcome']}",
+                f"- Grounding coverage: {item['grounding']['best_query_coverage']:.2f} ({item['grounding']['best_shared_term_count']} shared term(s))",
                 f"- Source filter: {item['source_filter'] or 'none'}",
                 f"- Expected sources: {', '.join(item['expected_sources']) or 'none'}",
                 f"- Forbidden sources: {', '.join(item['forbidden_sources']) or 'none'}",
@@ -1843,7 +2079,7 @@ def write_evaluation_report(
                 expected_recall = variant["expected_source_recall"]
                 lines.extend(
                     [
-                        f"- {variant['label']}: source overlap {variant['source_overlap']:.2f}, constellation overlap {variant['constellation_overlap']:.2f}, chunk overlap {variant['chunk_overlap']:.2f}, posture match {'yes' if variant['posture_match'] else 'no'}, agreement match {'yes' if variant['agreement_match'] else 'no'}, expected source recall {f'{expected_recall:.2f}' if expected_recall is not None else 'not evaluated'}",
+                        f"- {variant['label']}: source overlap {variant['source_overlap']:.2f}, constellation overlap {variant['constellation_overlap']:.2f}, chunk overlap {variant['chunk_overlap']:.2f}, posture match {'yes' if variant['posture_match'] else 'no'}, agreement match {'yes' if variant['agreement_match'] else 'no'}, grounding match {'yes' if variant['grounding_match'] else 'no'}, expected source recall {f'{expected_recall:.2f}' if expected_recall is not None else 'not evaluated'}",
                     ]
                 )
             lines.append("")
@@ -1876,6 +2112,7 @@ def command_ask(args: argparse.Namespace) -> None:
             "constellation_breakdown": result["constellation_breakdown"],
             "evidence_posture": result["evidence_posture"],
             "agreement_signal": result["agreement_signal"],
+            "grounding": result["grounding"],
             "source_filter": result["source_filter"],
             "meta": result["meta"],
             "evidence": [
@@ -1901,6 +2138,10 @@ def command_ask(args: argparse.Namespace) -> None:
 
     console.print("\n[bold]Answer[/bold]")
     console.print(result["answer"])
+    console.print(
+        f"\n[bold]Grounding[/bold] {result['grounding']['label']} "
+        f"({result['grounding']['best_query_coverage']:.2f} best query coverage)"
+    )
     if result["source_filter"]:
         console.print(f"\n[bold]Source filter[/bold] {result['source_filter']}")
     console.print(f"\n[bold]Source coverage[/bold] {result['source_count']} unique source(s)")
@@ -1948,6 +2189,8 @@ def command_evaluate(args: argparse.Namespace) -> None:
         max_flagged_query_rate=args.max_flagged_query_rate,
         max_forbidden_source_hit_rate=args.max_forbidden_source_hit_rate,
         min_conflict_source_recall=args.min_conflict_source_recall,
+        min_answerability_accuracy=args.min_answerability_accuracy,
+        min_abstention_recall=args.min_abstention_recall,
     )
 
     summary = evaluation["summary"]
@@ -1973,6 +2216,9 @@ def command_evaluate(args: argparse.Namespace) -> None:
         forbidden_rate,
     )
     table.add_row("Conflict source recall", conflict_recall)
+    table.add_row("Answerability accuracy", f"{summary['answerability_accuracy']:.2f}")
+    table.add_row("Abstention recall", f"{summary['abstention_recall']:.2f}")
+    table.add_row("Answer recall", f"{summary['answer_recall']:.2f}")
     table.add_row("Avg sources", str(summary["avg_source_count"]))
     table.add_row("Avg dominant source share", f"{summary['avg_dominant_source_share']:.2f}")
     table.add_row("Avg dominant constellation share", f"{summary['avg_dominant_constellation_share']:.2f}")
@@ -2112,6 +2358,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--min-conflict-source-recall",
         type=unit_interval,
         help="Fail when retrieval covers fewer than this share of declared conflict source groups.",
+    )
+    p_eval.add_argument(
+        "--min-answerability-accuracy",
+        type=unit_interval,
+        help="Fail when declared answer/abstain outcomes are classified below this accuracy.",
+    )
+    p_eval.add_argument(
+        "--min-abstention-recall",
+        type=unit_interval,
+        help="Fail when fewer than this share of declared abstention cases abstain.",
     )
     p_eval.set_defaults(func=command_evaluate)
 

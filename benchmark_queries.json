@@ -2,6 +2,7 @@
   {
     "label": "pause-despite-healthy-load",
     "query": "Why is the European checkout rollout paused even though load and latency checks passed?",
+    "expected_outcome": "answer",
     "expected_sources": [
       "operations/checkout_launch_decision",
       "engineering/checkout_load_test",
@@ -25,6 +26,7 @@
   {
     "label": "invoice-defect-corroboration",
     "query": "Which independent evidence confirms that duplicate VAT was a real charged invoice defect?",
+    "expected_outcome": "answer",
     "expected_sources": [
       "support/eu_checkout_escalations",
       "finance/eu_invoice_reconciliation",
@@ -44,6 +46,7 @@
   {
     "label": "current-launch-authority",
     "query": "What is the current go-live decision for European checkout?",
+    "expected_outcome": "answer",
     "expected_sources": ["operations/checkout_launch_decision"],
     "forbidden_sources": ["archive/checkout_launch_draft"],
     "variants": [
@@ -56,6 +59,7 @@
   {
     "label": "latency-root-cause-check",
     "query": "Was service latency the root cause of the European checkout pause?",
+    "expected_outcome": "answer",
     "expected_sources": [
       "operations/checkout_launch_decision",
       "engineering/checkout_load_test"
@@ -77,6 +81,7 @@
   {
     "label": "resume-criteria",
     "query": "What evidence and approvals are still required before European checkout can resume?",
+    "expected_outcome": "answer",
     "expected_sources": [
       "operations/checkout_launch_decision",
       "finance/eu_invoice_reconciliation",

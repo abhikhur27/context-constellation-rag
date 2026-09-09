@@ -26,6 +26,7 @@ jobs:
           --min-expected-source-mrr 0.30
           --min-variant-stability-rate 0.75
           --max-flagged-query-rate 0.25
+          --min-answerability-accuracy 1.0
           --json-out artifacts/ci-evaluation.json
           --report-out artifacts/ci-evaluation.md
       - run: python main.py index --corpus benchmark_corpus --index-dir artifacts/ci-operational-index --embedding-model hashing
@@ -41,5 +42,22 @@ jobs:
           --max-forbidden-source-hit-rate 0.0
           --min-conflict-source-recall 1.0
           --min-variant-stability-rate 1.0
+          --min-answerability-accuracy 1.0
           --json-out artifacts/ci-operational-evaluation.json
           --report-out artifacts/ci-operational-evaluation.md
+      - run: python main.py index --corpus grounding_corpus --index-dir artifacts/ci-grounding-index --embedding-model hashing
+      - name: Enforce independent grounding and abstention benchmark
+        run: >-
+          python main.py evaluate
+          --index-dir artifacts/ci-grounding-index
+          --queries grounding_queries.json
+          --llm off
+          --top-k 4
+          --min-expected-source-recall 0.875
+          --min-expected-source-mrr 0.54
+          --max-forbidden-source-hit-rate 0.0
+          --min-variant-stability-rate 0.50
+          --min-answerability-accuracy 1.0
+          --min-abstention-recall 1.0
+          --json-out artifacts/ci-grounding-evaluation.json
+          --report-out artifacts/ci-grounding-evaluation.md

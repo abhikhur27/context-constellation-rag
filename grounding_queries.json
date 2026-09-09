@@ -1,0 +1,78 @@
+[
+  {
+    "label": "hold-despite-throughput",
+    "query": "Why is the inventory database cutover paused even though application throughput passed?",
+    "expected_outcome": "answer",
+    "expected_sources": [
+      "operations/cutover_hold",
+      "reliability/replica_lag_review",
+      "recovery/restore_drill"
+    ],
+    "forbidden_sources": [
+      "archive/cutover_draft",
+      "analytics/reporting_refresh"
+    ],
+    "variants": [
+      {
+        "label": "capacity-versus-recovery",
+        "query": "If write traffic passed, why did replica lag and the recovery drill block the inventory migration?"
+      }
+    ]
+  },
+  {
+    "label": "resume-contract",
+    "query": "What must Reliability, Recovery, and Security prove before the database cutover can resume?",
+    "expected_outcome": "answer",
+    "expected_sources": [
+      "operations/cutover_hold",
+      "reliability/replica_lag_review",
+      "recovery/restore_drill",
+      "security/recovery_access"
+    ],
+    "forbidden_sources": [
+      "archive/cutover_draft",
+      "finance/migration_budget"
+    ],
+    "variants": [
+      {
+        "label": "cutover-signoff",
+        "query": "Which checks and approvals are required to restart the inventory cutover?"
+      }
+    ]
+  },
+  {
+    "label": "restore-failure",
+    "query": "Which exact restore step failed and what must a passing rerun validate?",
+    "expected_outcome": "answer",
+    "expected_sources": [
+      "recovery/restore_drill",
+      "security/recovery_access"
+    ],
+    "forbidden_sources": [
+      "analytics/reporting_refresh",
+      "vendor/capacity_quote"
+    ]
+  },
+  {
+    "label": "unsupported-customer-compensation",
+    "query": "What customer compensation amount and notification deadline were approved after the inventory migration delay?",
+    "expected_outcome": "abstain",
+    "variants": [
+      {
+        "label": "unsupported-service-credit",
+        "query": "How much service credit will customers receive, and when must they be notified about the delayed cutover?"
+      }
+    ]
+  },
+  {
+    "label": "unsupported-hardware-delivery",
+    "query": "Which failed database hardware vendor ticket, shipment carrier, and replacement delivery date cover the cutover incident?",
+    "expected_outcome": "abstain",
+    "variants": [
+      {
+        "label": "unsupported-repair-tracking",
+        "query": "What repair case number and tracking date identify the replacement database appliance?"
+      }
+    ]
+  }
+]

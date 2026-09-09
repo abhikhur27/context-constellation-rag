@@ -256,6 +256,7 @@ def ask() -> tuple[dict, int] | dict:
     return {
         "answer": result["answer"],
         "answer_mode": result["answer_mode"],
+        "grounding": result["grounding"],
         "evidence_posture": result["evidence_posture"],
         "evidence": evidence,
     }
