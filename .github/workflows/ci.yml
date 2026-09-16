@@ -53,10 +53,10 @@ jobs:
           --queries grounding_queries.json
           --llm off
           --top-k 4
-          --min-expected-source-recall 0.875
-          --min-expected-source-mrr 0.54
+          --min-expected-source-recall 1.0
+          --min-expected-source-mrr 0.57
           --max-forbidden-source-hit-rate 0.0
-          --min-variant-stability-rate 0.50
+          --min-variant-stability-rate 1.0
           --min-answerability-accuracy 1.0
           --min-abstention-recall 1.0
           --json-out artifacts/ci-grounding-evaluation.json

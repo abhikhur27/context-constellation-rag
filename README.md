@@ -7,7 +7,7 @@ It combines:
 - Vector embeddings (`sentence-transformers`)
 - Fast dense retrieval (`FAISS`)
 - Lexical retrieval (`TF-IDF`)
-- Source-scope-aware hybrid ranking + source-diverse MMR
+- Source-scope-aware hybrid ranking + query-anchor evidence chaining + source-diverse MMR
 - Optional LLM synthesis with grounded citations
 
 ## Why it exists
@@ -24,6 +24,8 @@ Instead of only returning nearest chunks, this project groups retrieved evidence
 `ask` now has an absolute grounding gate in addition to relative ranking. If no selected source directly covers enough of the requested subject, it returns `Insufficient evidence` instead of turning the closest topical match into an answer. JSON and Markdown outputs retain the closest-source trace plus the shared-term and query-coverage decision so abstention is auditable.
 
 Source paths are normalized across operating systems and included as searchable metadata. Dense relevance, lexical relevance, and source/title alignment feed the MMR selection step, which favors distinct sources before returning multiple chunks from one document. A narrow synonym bridge makes operational gate questions stable under wording such as `restart`/`resume`, `proof`/`evidence`, and `sign off`/`approval` without rewriting the dense semantic query. Queries asking for a current decision strongly demote archived or superseded evidence, while explicitly historical queries keep it eligible. Documents that disclaim the query's subject or explicitly say they did not validate the requested evidence are demoted only when the disclaimer overlaps the question's subject.
+
+The two strongest source-distinct query matches also act as bounded support anchors. A normalized lexical support score helps linked recovery, reliability, and approval records stay in the evidence budget when a short paraphrase names the decision but omits one underlying failure term. Answerability does not inherit the anchor score: the absolute grounding gate still requires direct subject coverage before an answer is allowed.
 
 ## Quick start
 
@@ -189,17 +191,17 @@ python main.py evaluate \
   --queries grounding_queries.json \
   --llm off \
   --top-k 4 \
-  --min-expected-source-recall 0.875 \
-  --min-expected-source-mrr 0.54 \
+  --min-expected-source-recall 1.0 \
+  --min-expected-source-mrr 0.57 \
   --max-forbidden-source-hit-rate 0.0 \
-  --min-variant-stability-rate 0.50 \
+  --min-variant-stability-rate 1.0 \
   --min-answerability-accuracy 1.0 \
   --min-abstention-recall 1.0
 ```
 
 The workflow requires retrieval changes to preserve the checkout evidence contract and this independent answer/abstain contract. A relative top result is no longer sufficient proof that the corpus can answer a question.
 
-At the four-source budget, the independent fixture freezes 0.875 expected-source recall, 0.5469 MRR, zero top-three distractor hits, and perfect answerability/abstention classification; these values are explicit baselines rather than claims of general RAG quality.
+At the four-source budget, the independent fixture now freezes 1.0 expected-source recall, 0.5781 MRR, zero top-three distractor hits, 1.0 paraphrase stability, and perfect answerability/abstention classification. These values are regression baselines, not claims of general RAG quality. The support-anchor sources and per-chunk anchor score are exported beside the existing dense, lexical, scope, and penalty diagnostics so the extra retrieval signal remains auditable.
 
 Answer JSON and Markdown reports include the expanded lexical retrieval query plus source-scope, stale-source, scope-mismatch, and non-evidence penalties for each selected chunk. Ranking behavior is therefore inspectable rather than hidden behind one aggregate score.
 

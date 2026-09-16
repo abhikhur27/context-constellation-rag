@@ -262,6 +262,50 @@ def normalize_scores(values: np.ndarray) -> np.ndarray:
     return (values - lo) / (hi - lo)
 
 
+def build_anchor_support_scores(
+    *,
+    lexical_matrix: Any,
+    ranked_candidates: list[int],
+    chunks: list[Chunk],
+    anchor_count: int = 2,
+) -> tuple[dict[int, float], list[int]]:
+    """Score evidence that lexically supports the strongest query matches.
+
+    Short queries often identify an authoritative decision record without
+    repeating every underlying failure or approval term. Use at most two
+    source-distinct, query-ranked anchors to recover those corroborating
+    records. Anchors remain query-selected; this pass never expands from an
+    arbitrary corpus document, and the later grounding gate still decides
+    whether the selected evidence can answer the question.
+    """
+    anchors: list[int] = []
+    anchor_sources: set[str] = set()
+    for index in ranked_candidates:
+        source = chunks[index].source
+        if source in anchor_sources:
+            continue
+        anchors.append(index)
+        anchor_sources.add(source)
+        if len(anchors) >= anchor_count:
+            break
+
+    if not anchors:
+        return {}, []
+
+    raw_scores = (lexical_matrix @ lexical_matrix[anchors].T).toarray()
+    max_scores = np.asarray(raw_scores.max(axis=1), dtype=np.float32).ravel()
+    non_anchor_candidates = [index for index in ranked_candidates if index not in anchors]
+    normalized_non_anchor = normalize_scores(
+        np.asarray([max_scores[index] for index in non_anchor_candidates], dtype=np.float32)
+    )
+    support_scores = {
+        index: float(score)
+        for index, score in zip(non_anchor_candidates, normalized_non_anchor.tolist())
+    }
+    support_scores.update({index: 1.0 for index in anchors})
+    return support_scores, anchors
+
+
 SCOPE_STOP_WORDS = {
     "a",
     "an",
@@ -317,6 +361,8 @@ SCOPE_GENERIC_TERMS = {
     "status",
     "test",
 }
+
+ANCHOR_SUPPORT_WEIGHT = 0.45
 
 
 RETRIEVAL_EQUIVALENCE_GROUPS = (
@@ -1190,12 +1236,27 @@ def run_query_payload(
     stale_penalties = build_stale_source_penalties(query, chunks)
     scope_mismatch_penalties = build_scope_mismatch_penalties(query, chunks)
     non_evidence_penalties = build_non_evidence_penalties(query, chunks)
-    adjusted_hybrid = np.asarray(
+    base_adjusted_hybrid = np.asarray(
         [
             float(hybrid[position])
             - stale_penalties.get(int(dense_indices[position]), 0.0)
             - scope_mismatch_penalties.get(int(dense_indices[position]), 0.0)
             - non_evidence_penalties.get(int(dense_indices[position]), 0.0)
+            for position in range(len(dense_indices))
+        ],
+        dtype=np.float32,
+    )
+    base_ordering = np.argsort(base_adjusted_hybrid)[::-1]
+    base_candidates = [int(dense_indices[i]) for i in base_ordering]
+    anchor_support_scores, support_anchor_indices = build_anchor_support_scores(
+        lexical_matrix=lexical_matrix,
+        ranked_candidates=base_candidates,
+        chunks=chunks,
+    )
+    adjusted_hybrid = np.asarray(
+        [
+            float(base_adjusted_hybrid[position])
+            + ANCHOR_SUPPORT_WEIGHT * anchor_support_scores.get(int(dense_indices[position]), 0.0)
             for position in range(len(dense_indices))
         ],
         dtype=np.float32,
@@ -1230,6 +1291,7 @@ def run_query_payload(
                 "dense": float(np.dot(query_vec, embeddings[idx])),
                 "lex": float(lex_scores_all[idx]),
                 "source_scope": float(source_scope_scores_all[idx]),
+                "anchor_support": anchor_support_scores.get(idx, 0.0),
                 "stale_source_penalty": stale_penalties.get(idx, 0.0),
                 "scope_mismatch_penalty": scope_mismatch_penalties.get(idx, 0.0),
                 "non_evidence_penalty": non_evidence_penalties.get(idx, 0.0),
@@ -1261,6 +1323,7 @@ def run_query_payload(
     return {
         "query": query,
         "retrieval_query": retrieval_query,
+        "support_anchors": [chunks[index].source for index in support_anchor_indices],
         "answer": answer,
         "answer_mode": answer_mode,
         "evidence": selected_rows,
@@ -1502,6 +1565,7 @@ def write_markdown_report(result: dict[str, Any], output_path: Path) -> None:
                 f"- Dense score: {row['dense']:.4f}",
                 f"- Lexical score: {row['lex']:.4f}",
                 f"- Source-scope score: {row['source_scope']:.4f}",
+                f"- Anchor-support score: {row['anchor_support']:.4f}",
                 f"- Stale-source penalty: {row['stale_source_penalty']:.2f}",
                 f"- Scope-mismatch penalty: {row['scope_mismatch_penalty']:.2f}",
                 f"- Non-evidence penalty: {row['non_evidence_penalty']:.2f}",
@@ -1529,6 +1593,7 @@ def write_markdown_report(result: dict[str, Any], output_path: Path) -> None:
         "",
         f"- Source filter: {result['source_filter'] or 'none'}",
         f"- Retrieval query: {result['retrieval_query']}",
+        f"- Support anchors: {', '.join(result['support_anchors']) or 'none'}",
         "",
         "## Source Breakdown",
         "",
@@ -2105,6 +2170,7 @@ def command_ask(args: argparse.Namespace) -> None:
         serializable = {
             "query": result["query"],
             "retrieval_query": result["retrieval_query"],
+            "support_anchors": result["support_anchors"],
             "answer": result["answer"],
             "answer_mode": result["answer_mode"],
             "source_count": result["source_count"],
@@ -2123,6 +2189,7 @@ def command_ask(args: argparse.Namespace) -> None:
                     "dense": row["dense"],
                     "lex": row["lex"],
                     "source_scope": row["source_scope"],
+                    "anchor_support": row["anchor_support"],
                     "stale_source_penalty": row["stale_source_penalty"],
                     "scope_mismatch_penalty": row["scope_mismatch_penalty"],
                     "non_evidence_penalty": row["non_evidence_penalty"],

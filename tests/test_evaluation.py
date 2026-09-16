@@ -4,10 +4,12 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 from main import (
     Chunk,
     EmbeddingEngine,
+    build_anchor_support_scores,
     build_answerability_metrics,
     build_conflict_source_metrics,
     build_expected_source_metrics,
@@ -68,6 +70,27 @@ class ExpectedSourceMetricTests(unittest.TestCase):
 
 
 class RetrievalContractTests(unittest.TestCase):
+    def test_anchor_support_uses_distinct_query_ranked_sources(self) -> None:
+        chunks = [
+            Chunk("decision::c1", "operations/decision.md", "cutover hold recovery lag", 0, 25),
+            Chunk("decision::c2", "operations/decision.md", "cutover decision", 26, 42),
+            Chunk("recovery::c1", "recovery/drill.md", "recovery restore validation", 0, 27),
+            Chunk("budget::c1", "finance/budget.md", "budget allocation spending", 0, 26),
+        ]
+        vectorizer = TfidfVectorizer()
+        matrix = vectorizer.fit_transform([chunk.text for chunk in chunks])
+
+        scores, anchors = build_anchor_support_scores(
+            lexical_matrix=matrix,
+            ranked_candidates=[0, 1, 2, 3],
+            chunks=chunks,
+        )
+
+        self.assertEqual(anchors, [0, 2])
+        self.assertEqual(scores[0], 1.0)
+        self.assertEqual(scores[2], 1.0)
+        self.assertGreater(scores[1], scores[3])
+
     def test_corpus_source_ids_are_portable_posix_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             nested = Path(temp_dir) / "operations"
