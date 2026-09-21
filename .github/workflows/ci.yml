@@ -61,3 +61,20 @@ jobs:
           --min-abstention-recall 1.0
           --json-out artifacts/ci-grounding-evaluation.json
           --report-out artifacts/ci-grounding-evaluation.md
+      - run: python main.py index --corpus adversarial_corpus --index-dir artifacts/ci-adversarial-index --embedding-model hashing
+      - name: Enforce adversarial domain-shift benchmark
+        run: >-
+          python main.py evaluate
+          --index-dir artifacts/ci-adversarial-index
+          --queries adversarial_queries.json
+          --llm off
+          --top-k 4
+          --min-expected-source-recall 1.0
+          --min-expected-source-mrr 0.57
+          --max-forbidden-source-hit-rate 0.0
+          --min-conflict-source-recall 1.0
+          --min-variant-stability-rate 1.0
+          --min-answerability-accuracy 1.0
+          --min-abstention-recall 1.0
+          --json-out artifacts/ci-adversarial-evaluation.json
+          --report-out artifacts/ci-adversarial-evaluation.md

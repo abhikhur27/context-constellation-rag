@@ -1,0 +1,120 @@
+[
+  {
+    "label": "hold-despite-throughput",
+    "query": "Why is the North warehouse fulfillment cutover paused even though throughput passed?",
+    "expected_outcome": "answer",
+    "expected_sources": [
+      "operations/fulfillment_cutover_decision",
+      "engineering/throughput_test",
+      "quality/retry_replay"
+    ],
+    "forbidden_sources": [
+      "archive/fulfillment_cutover_plan",
+      "search/catalog_latency_rollout",
+      "payroll/regional_cutover"
+    ],
+    "conflict_source_groups": [
+      ["engineering/throughput_test", "quality/retry_replay"]
+    ],
+    "variants": [
+      {
+        "label": "capacity-versus-correctness",
+        "query": "If fulfillment capacity is healthy, what retry evidence blocks the warehouse release?"
+      }
+    ]
+  },
+  {
+    "label": "duplicate-pick-corroboration",
+    "query": "Which independent records confirm that scanner retries created real duplicate pick work?",
+    "expected_outcome": "answer",
+    "expected_sources": [
+      "quality/retry_replay",
+      "warehouse/operator_incidents",
+      "inventory/unit_reconciliation"
+    ],
+    "forbidden_sources": [
+      "mobile/scanner_ui_release",
+      "security/badge_access_audit"
+    ],
+    "variants": [
+      {
+        "label": "test-operator-ledger-agreement",
+        "query": "Do the retry test, operator reports, and inventory ledger agree about repeated picks?"
+      }
+    ]
+  },
+  {
+    "label": "resume-contract",
+    "query": "What evidence and approvals are required before the North fulfillment cutover can resume?",
+    "expected_outcome": "answer",
+    "expected_sources": [
+      "operations/fulfillment_cutover_decision",
+      "quality/retry_replay",
+      "warehouse/operator_incidents",
+      "inventory/unit_reconciliation"
+    ],
+    "forbidden_sources": [
+      "archive/fulfillment_cutover_plan",
+      "payroll/regional_cutover",
+      "vendor/conveyor_capacity_quote"
+    ],
+    "variants": [
+      {
+        "label": "restart-signoff",
+        "query": "Which teams must sign off, and what must they prove, to restart the warehouse release?"
+      }
+    ]
+  },
+  {
+    "label": "current-authority",
+    "query": "Which document is the current authority for the North warehouse cutover?",
+    "expected_outcome": "answer",
+    "expected_sources": ["operations/fulfillment_cutover_decision"],
+    "forbidden_sources": ["archive/fulfillment_cutover_plan"],
+    "variants": [
+      {
+        "label": "latest-decision",
+        "query": "What is the latest go-live decision for North fulfillment?"
+      }
+    ]
+  },
+  {
+    "label": "historical-plan-change",
+    "query": "How did the superseded fulfillment cutover plan differ from the current decision?",
+    "expected_outcome": "answer",
+    "expected_sources": [
+      "archive/fulfillment_cutover_plan",
+      "operations/fulfillment_cutover_decision"
+    ],
+    "conflict_source_groups": [
+      ["archive/fulfillment_cutover_plan", "operations/fulfillment_cutover_decision"]
+    ]
+  },
+  {
+    "label": "unsupported-compensation",
+    "query": "What compensation amount and notification deadline were approved for customers affected by the duplicate warehouse picks?",
+    "expected_outcome": "abstain",
+    "forbidden_sources": ["customer/api_service_credit_policy"],
+    "variants": [
+      {
+        "label": "unsupported-service-credit",
+        "query": "How much service credit will duplicate-order customers receive, and when must they be notified?"
+      }
+    ]
+  },
+  {
+    "label": "unsupported-replacement-tracking",
+    "query": "Which scanner repair ticket, shipment carrier, and replacement hardware delivery date cover the cutover defect?",
+    "expected_outcome": "abstain",
+    "forbidden_sources": [
+      "logistics/spare_belt_delivery",
+      "vendor/conveyor_capacity_quote"
+    ],
+    "variants": [
+      {
+        "label": "unsupported-scanner-shipment",
+        "query": "What tracking reference and arrival date identify the replacement scanner shipment?"
+      }
+    ]
+  }
+]

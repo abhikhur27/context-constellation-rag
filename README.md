@@ -23,6 +23,8 @@ Instead of only returning nearest chunks, this project groups retrieved evidence
 
 `ask` now has an absolute grounding gate in addition to relative ranking. If no selected source directly covers enough of the requested subject, it returns `Insufficient evidence` instead of turning the closest topical match into an answer. JSON and Markdown outputs retain the closest-source trace plus the shared-term and query-coverage decision so abstention is auditable.
 
+Explicitly stale, out-of-scope, or non-evidence rows are no longer allowed to satisfy that grounding gate even when they remain visible in the retrieval trace. Requests for concrete amounts, deadlines, shipments, or ticket identifiers must also cover each requested detail family in affirmative evidence; nearby documents cannot be stitched together into a false answer from unrelated matching words.
+
 Source paths are normalized across operating systems and included as searchable metadata. Dense relevance, lexical relevance, and source/title alignment feed the MMR selection step, which favors distinct sources before returning multiple chunks from one document. A narrow synonym bridge makes operational gate questions stable under wording such as `restart`/`resume`, `proof`/`evidence`, and `sign off`/`approval` without rewriting the dense semantic query. Queries asking for a current decision strongly demote archived or superseded evidence, while explicitly historical queries keep it eligible. Documents that disclaim the query's subject or explicitly say they did not validate the requested evidence are demoted only when the disclaimer overlaps the question's subject.
 
 The two strongest source-distinct query matches also act as bounded support anchors. A normalized lexical support score helps linked recovery, reliability, and approval records stay in the evidence budget when a short paraphrase names the decision but omits one underlying failure term. Answerability does not inherit the anchor score: the absolute grounding gate still requires direct subject coverage before an answer is allowed.
@@ -203,9 +205,33 @@ The workflow requires retrieval changes to preserve the checkout evidence contra
 
 At the four-source budget, the independent fixture now freezes 1.0 expected-source recall, 0.5781 MRR, zero top-three distractor hits, 1.0 paraphrase stability, and perfect answerability/abstention classification. These values are regression baselines, not claims of general RAG quality. The support-anchor sources and per-chunk anchor score are exported beside the existing dense, lexical, scope, and penalty diagnostics so the extra retrieval signal remains auditable.
 
+### Adversarial domain-shift benchmark
+
+`adversarial_corpus/` adds a 14-document warehouse-fulfillment incident outside the checkout and database-recovery domains. It mixes a current cutover decision with corroborating quality, operator, and inventory records; a superseded plan; and near-match payroll, search, shipment, hardware, badge, mobile, and service-credit documents. The unsupported questions deliberately distribute tempting amount, deadline, carrier, ticket, and tracking terms across unrelated sources.
+
+Run the fourth CI gate:
+
+```bash
+python main.py index --corpus adversarial_corpus --index-dir artifacts/adversarial-index --embedding-model hashing
+python main.py evaluate \
+  --index-dir artifacts/adversarial-index \
+  --queries adversarial_queries.json \
+  --llm off \
+  --top-k 4 \
+  --min-expected-source-recall 1.0 \
+  --min-expected-source-mrr 0.57 \
+  --max-forbidden-source-hit-rate 0.0 \
+  --min-conflict-source-recall 1.0 \
+  --min-variant-stability-rate 1.0 \
+  --min-answerability-accuracy 1.0 \
+  --min-abstention-recall 1.0
+```
+
+The frozen top-four contract requires full expected-source and conflict recall, no forbidden top-three source, stable paraphrases, and perfect answer/abstain classification. It is intentionally small enough to stay deterministic in CI but large enough that returning most of the corpus cannot satisfy the gate.
+
 Answer JSON and Markdown reports include the expanded lexical retrieval query plus source-scope, stale-source, scope-mismatch, and non-evidence penalties for each selected chunk. Ranking behavior is therefore inspectable rather than hidden behind one aggregate score.
 
-All thresholds are optional values from `0` to `1`. The checked-in CI workflow builds deterministic hashing indexes, runs the unit suite, and enforces all three corpus gates without network-dependent embeddings.
+All thresholds are optional values from `0` to `1`. The checked-in CI workflow builds deterministic hashing indexes, runs the unit suite, and enforces all four corpus gates without network-dependent embeddings.
 
 ## Optional LLM mode
 
@@ -243,6 +269,7 @@ It also surfaces a quick evidence-coverage badge so demo viewers can tell when a
 - `example_queries.json`: starter evaluation suite with source expectations and paraphrase variants
 - `benchmark_corpus/` and `benchmark_queries.json`: heterogeneous offline retrieval regression fixture
 - `grounding_corpus/` and `grounding_queries.json`: independent answerability and abstention fixture
+- `adversarial_corpus/` and `adversarial_queries.json`: cross-domain distractor and unsupported-detail fixture
 - `tests/test_evaluation.py`: deterministic coverage for rank metrics, gates, and offline embeddings
 - `web_app.py`: tiny local browser UI for query + citation trace
 - `example_corpus/`: sample documents for demo

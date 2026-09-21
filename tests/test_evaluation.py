@@ -128,6 +128,7 @@ class RetrievalContractTests(unittest.TestCase):
         )
         self.assertEqual(build_stale_source_penalties("Compare both launch decisions", chunks), {})
         self.assertEqual(build_stale_source_penalties("Why did the launch fail?", chunks), {1: 0.30})
+        self.assertEqual(build_stale_source_penalties("What blocks the launch?", chunks), {1: 1.25})
 
     def test_source_scope_uses_path_and_heading_without_body_noise(self) -> None:
         chunk = Chunk(
@@ -178,6 +179,24 @@ class RetrievalContractTests(unittest.TestCase):
             {},
         )
 
+        throughput = [
+            Chunk(
+                "load::c1",
+                "engineering/throughput_test.md",
+                "# Fulfillment Throughput Test - 2026-09-07 "
+                "The test did not exercise retry idempotency.",
+                0,
+                91,
+            )
+        ]
+        self.assertEqual(
+            build_scope_mismatch_penalties(
+                "Why did healthy fulfillment capacity not prevent the hold?",
+                throughput,
+            ),
+            {},
+        )
+
     def test_offline_query_expansion_bridges_gate_paraphrases(self) -> None:
         expanded = expand_query_for_retrieval(
             "Which teams must sign off and what proof do they need to restart?"
@@ -187,6 +206,9 @@ class RetrievalContractTests(unittest.TestCase):
         self.assertIn("evidence", expanded)
         self.assertIn("resume", expanded)
         self.assertIn("requires", expanded)
+        capacity_expanded = expand_query_for_retrieval("Why did healthy capacity not prevent the hold?")
+        self.assertIn("throughput", capacity_expanded)
+        self.assertIn("performance", capacity_expanded)
         self.assertIn(
             "approval",
             expand_query_for_retrieval("What approvals are still required?"),
@@ -211,7 +233,7 @@ class RetrievalContractTests(unittest.TestCase):
                 "Which evidence confirms the invoice tax defect?",
                 chunks,
             ),
-            {0: 0.60},
+            {0: 0.85},
         )
         self.assertEqual(
             build_non_evidence_penalties(
@@ -219,6 +241,44 @@ class RetrievalContractTests(unittest.TestCase):
                 chunks,
             ),
             {},
+        )
+
+        contrasted = [
+            Chunk(
+                "load::c1",
+                "engineering/checkout_load_test.md",
+                "# Checkout Load Test - 2026-06-17 The healthy load result must not be "
+                "treated as approval of invoice correctness.",
+                0,
+                117,
+            )
+        ]
+        self.assertEqual(
+            build_non_evidence_penalties(
+                "If checkout load is healthy, what evidence blocks the release?",
+                contrasted,
+            ),
+            {},
+        )
+
+    def test_specific_detail_disclaimers_are_not_affirmative_evidence(self) -> None:
+        chunks = [
+            Chunk(
+                "credit::c1",
+                "customer/api_service_credit_policy.md",
+                "Customers may receive a 10 percent service credit within five days. "
+                "This policy does not cover warehouse picks or duplicate reservations.",
+                0,
+                137,
+            )
+        ]
+
+        self.assertEqual(
+            build_non_evidence_penalties(
+                "What service credit and deadline cover duplicate warehouse picks?",
+                chunks,
+            ),
+            {0: 0.85},
         )
 
     def test_forbidden_source_metrics_capture_distractor_rank(self) -> None:
@@ -299,6 +359,27 @@ class RetrievalContractTests(unittest.TestCase):
         self.assertEqual(supported["outcome"], "answer")
         self.assertEqual(unsupported["outcome"], "abstain")
         self.assertLess(unsupported["best_query_coverage"], 0.40)
+
+    def test_grounding_excludes_penalized_disclaimer_terms(self) -> None:
+        rows = [
+            evidence_row(1, "customer/api_service_credit_policy.md"),
+            evidence_row(2, "operations/cutover_hold.md"),
+        ]
+        rows[0]["chunk"].text = (
+            "Customers may receive a 10 percent service credit within five days. "
+            "This policy does not cover warehouse duplicate picks."
+        )
+        rows[0]["non_evidence_penalty"] = 0.85
+        rows[1]["chunk"].text = "The warehouse cutover remains paused after duplicate picks."
+
+        decision = build_grounding_decision(
+            "What service credit amount and deadline cover duplicate warehouse picks?",
+            rows,
+        )
+
+        self.assertEqual(decision["outcome"], "abstain")
+        self.assertFalse(decision["details"][0]["usable_for_grounding"])
+        self.assertEqual(decision["usable_source_count"], 1)
 
     def test_query_suite_validates_expected_outcome(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

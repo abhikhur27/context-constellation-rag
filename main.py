@@ -362,10 +362,59 @@ SCOPE_GENERIC_TERMS = {
     "test",
 }
 
-ANCHOR_SUPPORT_WEIGHT = 0.45
+ANCHOR_SUPPORT_WEIGHT = 0.70
+
+SPECIFIC_DETAIL_TERM_GROUPS = {
+    "financial amount": {
+        "amount",
+        "compensation",
+        "credit",
+        "cost",
+        "dollar",
+        "dollars",
+        "percent",
+        "percentage",
+        "price",
+        "refund",
+    },
+    "deadline or notification": {
+        "arrival",
+        "date",
+        "deadline",
+        "notify",
+        "notification",
+        "notified",
+        "schedule",
+        "scheduled",
+        "when",
+    },
+    "shipment or carrier": {
+        "carrier",
+        "delivery",
+        "shipment",
+        "shipped",
+        "shipping",
+        "tracking",
+    },
+    "ticket or identifier": {
+        "case",
+        "identifier",
+        "reference",
+        "repair",
+        "ticket",
+    },
+}
 
 
 RETRIEVAL_EQUIVALENCE_GROUPS = (
+    (
+        ("capacity", "performance"),
+        ("capacity", "load", "performance", "throughput", "volume"),
+    ),
+    (
+        ("latency", "response time"),
+        ("latency", "load", "performance", "response time"),
+    ),
     (
         ("approve", "approval", "approvals", "approved", "sign off", "sign-off"),
         ("approve", "approval", "approvals", "approved", "sign off", "sign-off"),
@@ -454,10 +503,12 @@ def build_scope_mismatch_penalties(query: str, chunks: list[Chunk]) -> dict[int,
     subject, so require at least two query terms to align with its source/title
     before treating the disclaimer as relevant evidence.
     """
-    query_terms = scope_tokens(query)
+    query_terms = scope_tokens(expand_query_for_retrieval(query))
     disclaimer_pattern = re.compile(
-        r"\b(no relationship to|concerns .{0,80}? only|not approval for|"
-        r"unrelated to|outside (?:the )?scope|does not (?:cover|address|apply)|"
+        r"\b(no relationship to|concerns .{0,80}? only|did not (?:exercise|validate)|"
+        r"not (?:a|an) (?:approval|delivery|repair|shipment|ticket)|not approval for|"
+        r"separate from|unrelated to|outside (?:the )?scope|"
+        r"does not (?:cover|address|apply|change|establish|exercise|validate)|"
         r"(?:is|are) not .{0,60}? evidence)\b",
         flags=re.IGNORECASE,
     )
@@ -483,8 +534,10 @@ def build_non_evidence_penalties(query: str, chunks: list[Chunk]) -> dict[int, f
     invoice reconciliation that actually confirms the defect.
     """
     evidence_intent = re.search(
-        r"\b(agree|approv\w*|confirm\w*|corroborat\w*|evidence|proof|"
-        r"require\w*|restart|resume|sign[ -]off|validat\w*)\b",
+        r"\b(agree|amount|approv\w*|carrier|compensation|confirm\w*|credit|"
+        r"corroborat\w*|deadline|deliver\w*|evidence|identif\w*|notification|"
+        r"notif\w*|proof|repair|require\w*|restart|resume|shipment|sign[ -]off|"
+        r"ticket|tracking|validat\w*)\b",
         query,
         flags=re.IGNORECASE,
     )
@@ -492,10 +545,21 @@ def build_non_evidence_penalties(query: str, chunks: list[Chunk]) -> dict[int, f
         return {}
 
     query_terms = scope_tokens(expand_query_for_retrieval(query)) - SCOPE_GENERIC_TERMS
+    contrast_intent = re.search(
+        r"\b(although|despite|even though|root cause)\b|"
+        r"\b(?:healthy|passed)\b.{0,80}\b(?:block\w*|hold|pause\w*|stop\w*)\b|"
+        r"\bnot prevent\b",
+        query,
+        flags=re.IGNORECASE,
+    )
     disclaimer_pattern = re.compile(
-        r"\b(did not validate|does not (?:confirm|support|validate)|has no evidence|"
-        r"contains no evidence|must not be treated as approval|not approval for|"
-        r"no relationship to|unrelated to)\b",
+        r"\b(did not (?:exercise|establish|validate)|"
+        r"does not (?:change|confirm|cover|establish|exercise|identify|record|"
+        r"support|validate)|has no (?:evidence|relationship|shipment|ticket)|"
+        r"contains no evidence|must not be treated as approval|not (?:a|an) "
+        r"(?:approval|delivery|repair|shipment|ticket)|not approval for|"
+        r"no (?:delivery|repair|shipment|ticket)|no relationship to|"
+        r"separate from|unrelated to)\b",
         flags=re.IGNORECASE,
     )
     penalties: dict[int, float] = {}
@@ -508,8 +572,14 @@ def build_non_evidence_penalties(query: str, chunks: list[Chunk]) -> dict[int, f
         for sentence in disclaimer_sentences:
             disclaimer_terms.update(scope_tokens(sentence) - SCOPE_GENERIC_TERMS)
         overlap = len(query_terms & disclaimer_terms)
+        source_scope_overlap = len(
+            query_terms
+            & (scope_tokens(build_source_scope_text(chunk)) - SCOPE_GENERIC_TERMS)
+        )
+        if contrast_intent and source_scope_overlap >= 2:
+            continue
         if overlap >= 2:
-            penalties[index] = 0.60
+            penalties[index] = 0.85
     return penalties
 
 
@@ -523,7 +593,7 @@ def build_stale_source_penalties(query: str, chunks: list[Chunk]) -> dict[int, f
         return {}
 
     current_intent = re.search(
-        r"\b(blocking|current|decision|go-live|latest|now|paused|required|restart|resume|"
+        r"\b(block\w*|current|decision|go-live|hold|latest|now|paused|required|restart|resume|"
         r"authoritative|authority)\b",
         query,
         flags=re.IGNORECASE,
@@ -619,10 +689,15 @@ def build_grounding_decision(
     """
     query_terms = scope_tokens(query)
     required_shared_terms = 1 if len(query_terms) <= 3 else 2
-    requests_specific_detail = bool(
+    query_terms_lower = {term.lower() for term in query_terms}
+    required_specific_detail_groups = {
+        label: terms
+        for label, terms in SPECIFIC_DETAIL_TERM_GROUPS.items()
+        if query_terms_lower & terms
+    }
+    requests_specific_detail = bool(required_specific_detail_groups) or bool(
         re.search(
-            r"\b(amount|carrier|case number|deadline|delivery|exact|identifier|"
-            r"how much|shipment|ticket|tracking)\b",
+            r"\b(case number|exact|how much)\b",
             query,
             flags=re.IGNORECASE,
         )
@@ -638,7 +713,14 @@ def build_grounding_decision(
         evidence_terms = scope_tokens(
             f"{build_source_scope_text(chunk)} {chunk.text}"
         )
-        union_evidence_terms.update(evidence_terms)
+        disqualifying_penalty = max(
+            float(row.get("stale_source_penalty", 0.0)),
+            float(row.get("scope_mismatch_penalty", 0.0)),
+            float(row.get("non_evidence_penalty", 0.0)),
+        )
+        usable_for_grounding = disqualifying_penalty < 0.50
+        if usable_for_grounding:
+            union_evidence_terms.update(evidence_terms)
         shared_terms = sorted(query_terms & evidence_terms)
         coverage = len(shared_terms) / len(query_terms) if query_terms else 0.0
         details.append(
@@ -651,18 +733,29 @@ def build_grounding_decision(
                 "dense_score": round(float(row.get("dense", 0.0)), 4),
                 "lexical_score": round(float(row.get("lex", 0.0)), 4),
                 "source_scope_score": round(float(row.get("source_scope", 0.0)), 4),
+                "disqualifying_penalty": round(disqualifying_penalty, 4),
+                "usable_for_grounding": usable_for_grounding,
             }
         )
 
-    best_coverage = max((item["query_coverage"] for item in details), default=0.0)
-    best_shared_count = max((item["shared_term_count"] for item in details), default=0)
-    best_dense_score = max((item["dense_score"] for item in details), default=0.0)
-    best_lexical_score = max((item["lexical_score"] for item in details), default=0.0)
+    usable_details = [item for item in details if item["usable_for_grounding"]]
+    best_coverage = max((item["query_coverage"] for item in usable_details), default=0.0)
+    best_shared_count = max((item["shared_term_count"] for item in usable_details), default=0)
+    best_dense_score = max((item["dense_score"] for item in usable_details), default=0.0)
+    best_lexical_score = max((item["lexical_score"] for item in usable_details), default=0.0)
     union_shared_terms = sorted(query_terms & union_evidence_terms)
     union_coverage = len(union_shared_terms) / len(query_terms) if query_terms else 0.0
+    covered_specific_detail_groups = sorted(
+        label
+        for label, terms in required_specific_detail_groups.items()
+        if union_evidence_terms & terms
+    )
+    specific_detail_supported = len(covered_specific_detail_groups) == len(
+        required_specific_detail_groups
+    )
     best_rows = [
         item
-        for item in details
+        for item in usable_details
         if item["query_coverage"] == best_coverage
         and item["shared_term_count"] == best_shared_count
     ]
@@ -679,7 +772,7 @@ def build_grounding_decision(
         len(union_shared_terms) >= required_shared_terms
         and union_coverage >= min_union_query_coverage
     )
-    supported = bool(query_terms) and (
+    supported = bool(query_terms) and specific_detail_supported and (
         short_query_supported or single_source_supported or cross_source_supported
     )
 
@@ -692,6 +785,9 @@ def build_grounding_decision(
         "min_query_coverage": min_query_coverage,
         "min_specific_query_coverage": min_specific_query_coverage,
         "requests_specific_detail": requests_specific_detail,
+        "required_specific_detail_groups": sorted(required_specific_detail_groups),
+        "covered_specific_detail_groups": covered_specific_detail_groups,
+        "specific_detail_supported": specific_detail_supported,
         "required_query_coverage": required_query_coverage,
         "min_union_query_coverage": min_union_query_coverage,
         "best_shared_term_count": best_shared_count,
@@ -702,6 +798,7 @@ def build_grounding_decision(
         "union_shared_term_count": len(union_shared_terms),
         "union_query_coverage": round(union_coverage, 4),
         "best_sources": [item["source"] for item in best_rows],
+        "usable_source_count": len({item["source"] for item in usable_details}),
         "details": details,
     }
 
@@ -886,17 +983,28 @@ def build_variant_stability_summary(
         variant_sources = source_set(variant["result"])
         variant_constellations = constellation_set(variant["result"])
         variant_chunks = chunk_id_set(variant["result"])
+        source_overlap = compute_set_overlap(primary_sources, variant_sources)
+        constellation_overlap = compute_set_overlap(
+            primary_constellations,
+            variant_constellations,
+        )
+        same_evidence_families = source_overlap == 1.0
         details.append(
             {
                 "label": variant["label"],
                 "query": variant["query"],
                 "source_filter": variant["source_filter"],
-                "source_overlap": compute_set_overlap(primary_sources, variant_sources),
-                "constellation_overlap": compute_set_overlap(primary_constellations, variant_constellations),
+                "source_overlap": source_overlap,
+                "constellation_overlap": constellation_overlap,
                 "chunk_overlap": compute_set_overlap(primary_chunks, variant_chunks),
                 "posture_match": (
-                    primary_posture["coverage_label"] == variant["result"]["evidence_posture"]["coverage_label"]
-                    and primary_posture["tension_label"] == variant["result"]["evidence_posture"]["tension_label"]
+                    same_evidence_families
+                    or (
+                        primary_posture["coverage_label"]
+                        == variant["result"]["evidence_posture"]["coverage_label"]
+                        and primary_posture["tension_label"]
+                        == variant["result"]["evidence_posture"]["tension_label"]
+                    )
                 ),
                 "agreement_match": primary_agreement == variant["result"]["agreement_signal"]["label"],
                 "grounding_match": primary_grounding == variant["result"]["grounding"]["outcome"],
